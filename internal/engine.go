@@ -52,22 +52,31 @@ type ClientEvent struct {
 	SessionID string
 	PlayerID  string
 	Request   Request
-	Conn      interface{}
+	Conn      any
 	Resp      chan Response
 }
 
+type SessionRecord struct {
+	SessionID string `json:"session_id"`
+	PlayerID  string `json:"player_id"`
+	RoomID    string `json:"room_id,omitempty"`
+	Result    string `json:"result"`
+}
+
 type Engine struct {
-	store        *Store
-	proposalTTL  time.Duration
-	emptyTTL     time.Duration
-	queue        []QueueRecord
-	rooms        map[string]*Room
-	sessions     map[string]string
-	players      map[string]string
-	nextSeq      int64
-	nextRoom     int64
-	now          func() time.Time
-	sessionNonce atomic.Int64
+	store          *Store
+	proposalTTL    time.Duration
+	emptyTTL       time.Duration
+	queue          []QueueRecord
+	rooms          map[string]*Room
+	sessions       map[string]string
+	sessionRecords map[string]*SessionRecord
+	players        map[string]string
+	notifications  map[string]Response
+	nextSeq        int64
+	nextRoom       int64
+	now            func() time.Time
+	sessionNonce   atomic.Int64
 }
 
 func NewEngine(store *Store, now func() time.Time) (*Engine, error) {
@@ -75,13 +84,13 @@ func NewEngine(store *Store, now func() time.Time) (*Engine, error) {
 		now = time.Now
 	}
 	nowMS := now().UnixMilli()
-	nextSeq, queue, rooms, err := store.Load(nowMS, int64(10*time.Second/time.Millisecond))
+	nextSeq, queue, rooms, records, err := store.Load(nowMS, int64(10*time.Second/time.Millisecond))
 	if err != nil {
 		return nil, err
 	}
 	e := &Engine{store: store, proposalTTL: 10 * time.Second, emptyTTL: 15 * time.Second,
-		queue: queue, rooms: rooms, sessions: map[string]string{}, players: map[string]string{},
-		nextSeq: nextSeq, nextRoom: 1, now: now}
+		queue: queue, rooms: rooms, sessions: map[string]string{}, sessionRecords: records, players: map[string]string{},
+		notifications: map[string]Response{}, nextSeq: nextSeq, nextRoom: 1, now: now}
 	for id := range rooms {
 		var n int64
 		fmt.Sscanf(id, "room-%d", &n)
@@ -93,7 +102,18 @@ func NewEngine(store *Store, now func() time.Time) (*Engine, error) {
 	return e, nil
 }
 
-func (e *Engine) save() error { return e.store.Save(e.nextSeq, e.queue, e.rooms) }
+func (e *Engine) save() error {
+	return e.store.Save(e.nextSeq, e.queue, e.rooms, e.sessionRecords)
+}
+
+func (e *Engine) SetTimeouts(proposalTTL, emptyTTL time.Duration) {
+	if proposalTTL > 0 {
+		e.proposalTTL = proposalTTL
+	}
+	if emptyTTL > 0 {
+		e.emptyTTL = emptyTTL
+	}
+}
 
 func (e *Engine) queued(player string) bool {
 	for _, item := range e.queue {
@@ -105,12 +125,21 @@ func (e *Engine) queued(player string) bool {
 }
 
 func (e *Engine) roomOf(player string) *Room {
-	for _, room := range e.rooms {
+	for _, room := range e.roomsSorted() {
 		if _, ok := room.Members[player]; ok {
 			return room
 		}
 	}
 	return nil
+}
+
+func (e *Engine) roomsSorted() []*Room {
+	rooms := make([]*Room, 0, len(e.rooms))
+	for _, room := range e.rooms {
+		rooms = append(rooms, room)
+	}
+	sort.Slice(rooms, func(i, j int) bool { return rooms[i].CreatedSeq < rooms[j].CreatedSeq })
+	return rooms
 }
 
 func (e *Engine) Hello(player string) (string, Response) {
@@ -122,6 +151,12 @@ func (e *Engine) Hello(player string) (string, Response) {
 	sessionID := fmt.Sprintf("s-%d-%d", e.now().UnixNano(), n)
 	e.sessions[sessionID] = player
 	e.players[player] = sessionID
+	if e.sessionRecords == nil {
+		e.sessionRecords = map[string]*SessionRecord{}
+	}
+	if e.sessionRecords[sessionID] == nil {
+		e.sessionRecords[sessionID] = &SessionRecord{SessionID: sessionID, PlayerID: player}
+	}
 	resp := Response{Type: "hello", OK: true, SessionID: sessionID}
 	if room := e.roomOf(player); room != nil {
 		resp.Type = "resumed"
@@ -135,18 +170,87 @@ func (e *Engine) Hello(player string) (string, Response) {
 
 func (e *Engine) CurrentSession(player string) string { return e.players[player] }
 
-func (e *Engine) PublicRoomStates() map[string]Response {
-	states := map[string]Response{}
-	for _, room := range e.rooms {
-		for playerID, member := range room.Members {
-			states[playerID] = Response{Type: "room_state", OK: true, RoomID: room.ID, Mode: room.Mode,
-				RoomSize: room.Size, Members: room.confirmedIDs(), Reason: member.Status, DeadlineMS: room.DeadlineUnixMS}
+func (e *Engine) SessionRecord(sessionID string) SessionRecord {
+	if record := e.sessionRecords[sessionID]; record != nil {
+		return *record
+	}
+	return SessionRecord{}
+}
+
+func (e *Engine) markResult(room *Room, result string, players ...string) {
+	for _, player := range players {
+		if sessionID := e.players[player]; sessionID != "" {
+			record := e.sessionRecords[sessionID]
+			if record != nil {
+				record.Result = result
+				if room != nil {
+					record.RoomID = room.ID
+				}
+			}
 		}
 	}
-	for _, item := range e.queue {
-		states[item.PlayerID] = Response{Type: "queued", OK: true, Waiting: e.waitingIDs()}
+}
+
+func (e *Engine) markResultIfEmpty(room *Room, result string, players ...string) {
+	for _, player := range players {
+		if sessionID := e.players[player]; sessionID != "" {
+			record := e.sessionRecords[sessionID]
+			if record != nil && record.Result == "" {
+				record.Result = result
+				record.RoomID = room.ID
+			}
+		}
 	}
-	return states
+}
+
+func (e *Engine) dissolveProposal(room *Room, leavingPlayer string, leavingResult string) Response {
+	remaining := make([]string, 0, len(room.Members)-1)
+	for playerID := range room.Members {
+		if playerID != leavingPlayer {
+			remaining = append(remaining, playerID)
+		}
+	}
+	e.markResult(room, leavingResult, leavingPlayer)
+	delete(e.rooms, room.ID)
+	e.markResultIfEmpty(room, StatusCanceled, remaining...)
+	for _, playerID := range remaining {
+		e.notify(playerID, Response{Type: StatusCanceled, OK: true, RoomID: room.ID, Mode: room.Mode, RoomSize: room.Size})
+		e.queue = append(e.queue, QueueRecord{Seq: e.nextSeq, PlayerID: playerID, Mode: room.Mode, Level: room.Level, RoomSize: room.Size})
+		e.nextSeq++
+	}
+	e.match()
+	_ = e.save()
+	return Response{Type: leavingResult, OK: true, RoomID: room.ID}
+}
+
+func (e *Engine) notify(player string, resp Response) {
+	if e.notifications == nil {
+		e.notifications = map[string]Response{}
+	}
+	e.notifications[player] = resp
+}
+
+func (e *Engine) notifyRoom(room *Room) {
+	if room == nil {
+		return
+	}
+	for playerID, member := range room.Members {
+		respType := "room_state"
+		if member.Status == StatusInvited {
+			respType = "invited"
+		}
+		e.notify(playerID, Response{Type: respType, OK: true, RoomID: room.ID, Mode: room.Mode,
+			RoomSize: room.Size, Members: room.confirmedIDs(), Reason: member.Status, DeadlineMS: room.DeadlineUnixMS})
+	}
+}
+
+func (e *Engine) Notifications() map[string]Response {
+	notifications := e.notifications
+	if notifications == nil {
+		notifications = map[string]Response{}
+	}
+	e.notifications = map[string]Response{}
+	return notifications
 }
 
 func (e *Engine) Disconnect(sessionID string) {
@@ -160,11 +264,16 @@ func (e *Engine) Disconnect(sessionID string) {
 	}
 	e.removeQueue(player)
 	if room := e.roomOf(player); room != nil {
+		e.markResultIfEmpty(room, StatusCanceled, player)
 		delete(room.Members, player)
+		if len(room.Members) == 0 {
+			delete(e.rooms, room.ID)
+		}
 		if room.Status == StatusActive && len(room.Members) < room.Size && room.EmptySinceUnixMS == 0 {
 			room.EmptySinceUnixMS = e.now().UnixMilli()
 		}
 		e.fillVacancies()
+		e.notifyRoom(room)
 	}
 	_ = e.save()
 }
@@ -223,15 +332,20 @@ func (e *Engine) cancel(req Request, sessionID string) Response {
 		return Response{Type: "error", Reason: "stale_session"}
 	}
 	if room := e.roomOf(req.PlayerID); room != nil {
+		if room.Status == StatusProposed {
+			return e.dissolveProposal(room, req.PlayerID, StatusCanceled)
+		}
 		delete(room.Members, req.PlayerID)
-		if room.Status == StatusActive && len(room.Members) < room.Size && room.EmptySinceUnixMS == 0 {
-			room.EmptySinceUnixMS = e.now().UnixMilli()
+		if len(room.Members) == 0 {
+			delete(e.rooms, room.ID)
 		}
 		if room.Status == StatusActive && len(room.Members) < room.Size && room.EmptySinceUnixMS == 0 {
 			room.EmptySinceUnixMS = e.now().UnixMilli()
 		}
 		e.fillVacancies()
 		_ = e.save()
+		e.markResult(room, StatusCanceled, req.PlayerID)
+		e.notifyRoom(room)
 		return Response{Type: "canceled", OK: true, RoomID: room.ID}
 	}
 	if e.removeQueue(req.PlayerID) {
@@ -255,8 +369,14 @@ func (e *Engine) confirm(req Request, sessionID string) Response {
 		room.Status = StatusActive
 		room.DeadlineUnixMS = 0
 		room.EmptySinceUnixMS = 0
+		ids := make([]string, 0, len(room.Members))
+		for id := range room.Members {
+			ids = append(ids, id)
+		}
+		e.markResult(room, StatusActive, ids...)
 	}
 	_ = e.save()
+	e.notifyRoom(room)
 	return Response{Type: "confirmed", OK: true, RoomID: room.ID, Status: room.Status, Members: room.confirmedIDs()}
 }
 
@@ -268,12 +388,17 @@ func (e *Engine) reject(req Request, sessionID string) Response {
 	if room == nil || room.ID != req.RoomID {
 		return Response{Type: "error", Reason: "not_invited"}
 	}
+	if room.Status == StatusProposed {
+		return e.dissolveProposal(room, req.PlayerID, "rejected")
+	}
 	delete(room.Members, req.PlayerID)
 	if room.Status == StatusActive && len(room.Members) < room.Size && room.EmptySinceUnixMS == 0 {
 		room.EmptySinceUnixMS = e.now().UnixMilli()
 	}
 	e.fillVacancies()
 	_ = e.save()
+	e.markResult(room, "rejected", req.PlayerID)
+	e.notifyRoom(room)
 	return Response{Type: "rejected", OK: true, RoomID: room.ID}
 }
 
@@ -329,6 +454,7 @@ func (e *Engine) match() {
 			chosen[item.PlayerID] = true
 			room.Members[item.PlayerID] = &Member{PlayerID: item.PlayerID, Status: StatusInvited}
 		}
+		e.notifyRoom(room)
 		e.rooms[id] = room
 		remaining := e.queue[:0]
 		for _, item := range e.queue {
@@ -342,7 +468,9 @@ func (e *Engine) match() {
 
 func (e *Engine) fillVacancies() {
 	sort.SliceStable(e.queue, func(i, j int) bool { return e.queue[i].Seq < e.queue[j].Seq })
-	for _, room := range e.rooms {
+	for _, room := range e.roomsSorted() {
+		added := false
+		deadline := room.DeadlineUnixMS
 		for len(room.Members) < room.Size {
 			index := -1
 			for i, item := range e.queue {
@@ -357,13 +485,18 @@ func (e *Engine) fillVacancies() {
 			item := e.queue[index]
 			e.queue = append(e.queue[:index], e.queue[index+1:]...)
 			room.Members[item.PlayerID] = &Member{PlayerID: item.PlayerID, Status: StatusInvited}
-			room.DeadlineUnixMS = e.now().Add(e.proposalTTL).UnixMilli()
+			added = true
+			deadline = e.now().Add(e.proposalTTL).UnixMilli()
 			if room.Status == StatusActive && room.EmptySinceUnixMS == 0 {
 				room.EmptySinceUnixMS = e.now().UnixMilli()
 			}
 		}
+		room.DeadlineUnixMS = deadline
 		if len(room.Members) == room.Size {
 			room.EmptySinceUnixMS = 0
+		}
+		if added {
+			e.notifyRoom(room)
 		}
 	}
 }
@@ -376,34 +509,52 @@ func (e *Engine) Tick() []Response {
 		case StatusProposed:
 			if room.DeadlineUnixMS > 0 && nowMS >= room.DeadlineUnixMS {
 				if room.allConfirmed() {
-					room.Status = StatusActive
-					room.DeadlineUnixMS = 0
+					if len(room.Members) == room.Size {
+						room.Status = StatusActive
+						room.DeadlineUnixMS = 0
+					}
 					changed = true
 					continue
 				}
+				expired := make([]string, 0, len(room.Members))
 				for playerID, member := range room.Members {
 					if member.Status == StatusConfirmed || member.Status == StatusInvited {
-						e.queue = append(e.queue, QueueRecord{Seq: e.nextSeq, PlayerID: playerID, Mode: room.Mode, Level: room.Level, RoomSize: room.Size})
-						e.nextSeq++
+						expired = append(expired, playerID)
 					}
 				}
 				delete(e.rooms, id)
+				for _, playerID := range expired {
+					e.markResultIfEmpty(room, StatusCanceled, playerID)
+					e.notify(playerID, Response{Type: StatusCanceled, OK: true, RoomID: room.ID, Mode: room.Mode, RoomSize: room.Size})
+					e.queue = append(e.queue, QueueRecord{Seq: e.nextSeq, PlayerID: playerID, Mode: room.Mode, Level: room.Level, RoomSize: room.Size})
+					e.nextSeq++
+				}
 				changed = true
 			}
 		case StatusActive:
 			if room.DeadlineUnixMS > 0 && nowMS >= room.DeadlineUnixMS {
+				expired := []string{}
 				for playerID, member := range room.Members {
 					if member.Status == StatusInvited {
-						e.queue = append(e.queue, QueueRecord{Seq: e.nextSeq, PlayerID: playerID, Mode: room.Mode, Level: room.Level, RoomSize: room.Size})
-						e.nextSeq++
+						expired = append(expired, playerID)
 						delete(room.Members, playerID)
 					}
 				}
+				room.DeadlineUnixMS = 0
 				if room.allConfirmed() {
-					room.DeadlineUnixMS = 0
 					room.EmptySinceUnixMS = 0
+				} else {
+					room.EmptySinceUnixMS = nowMS
 				}
 				changed = true
+				for _, playerID := range expired {
+					e.markResultIfEmpty(room, StatusCanceled, playerID)
+					e.notify(playerID, Response{Type: StatusCanceled, OK: true, RoomID: room.ID, Mode: room.Mode, RoomSize: room.Size})
+				}
+				for _, playerID := range expired {
+					e.queue = append(e.queue, QueueRecord{Seq: e.nextSeq, PlayerID: playerID, Mode: room.Mode, Level: room.Level, RoomSize: room.Size})
+					e.nextSeq++
+				}
 			}
 			e.fillVacancies()
 			if len(room.Members) < room.Size {
@@ -459,4 +610,13 @@ func abs(v int) int {
 		return -v
 	}
 	return v
+}
+
+func itemLevel(room *Room) int {
+	for _, member := range room.Members {
+		if member.Status == StatusConfirmed {
+			return room.Level
+		}
+	}
+	return room.Level
 }

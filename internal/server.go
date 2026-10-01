@@ -12,14 +12,21 @@ import (
 )
 
 type Server struct {
-	engine    *Engine
-	listener  net.Listener
-	ch        chan ClientEvent
-	wg        sync.WaitGroup
-	mu        sync.Mutex
-	conns     map[string]net.Conn
-	done      chan struct{}
-	closeOnce sync.Once
+	engine       *Engine
+	listener     net.Listener
+	ch           chan ClientEvent
+	wg           sync.WaitGroup
+	connWg       sync.WaitGroup
+	mu           sync.Mutex
+	clients      map[string]*serverClient
+	done         chan struct{}
+	closeOnce    sync.Once
+	tickInterval time.Duration
+}
+
+type serverClient struct {
+	conn net.Conn
+	ch   chan Response
 }
 
 func NewServer(engine *Engine, address string) (*Server, error) {
@@ -27,19 +34,51 @@ func NewServer(engine *Engine, address string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{engine: engine, listener: listener, ch: make(chan ClientEvent, 1024), conns: map[string]net.Conn{}, done: make(chan struct{})}
+	return newServer(engine, listener, 50*time.Millisecond), nil
+}
+
+func newServer(engine *Engine, listener net.Listener, tickInterval time.Duration) *Server {
+	if tickInterval <= 0 {
+		tickInterval = 50 * time.Millisecond
+	}
+	s := &Server{
+		engine: engine, listener: listener, ch: make(chan ClientEvent, 1024),
+		clients: map[string]*serverClient{},
+		done:    make(chan struct{}), tickInterval: tickInterval,
+	}
 	s.wg.Add(2)
 	go s.loop()
 	go s.tickLoop()
-	return s, nil
+	return s
 }
 
-func (s *Server) Address() string { return s.listener.Addr().String() }
+func (s *Server) Address() string {
+	if s.listener == nil {
+		return ""
+	}
+	return s.listener.Addr().String()
+}
 
 func (s *Server) Close() error {
-	s.closeOnce.Do(func() { close(s.done); s.listener.Close() })
+	var err error
+	s.closeOnce.Do(func() {
+		close(s.done)
+		if s.listener != nil {
+			err = s.listener.Close()
+		}
+		s.mu.Lock()
+		clients := make([]*serverClient, 0, len(s.clients))
+		for _, client := range s.clients {
+			clients = append(clients, client)
+		}
+		s.mu.Unlock()
+		for _, client := range clients {
+			_ = client.conn.Close()
+		}
+	})
 	s.wg.Wait()
-	return nil
+	s.connWg.Wait()
+	return err
 }
 
 func (s *Server) loop() {
@@ -49,37 +88,45 @@ func (s *Server) loop() {
 		case <-s.done:
 			return
 		case event := <-s.ch:
-			switch event.Kind {
-			case "hello":
-				sessionID, resp := s.engine.Hello(event.PlayerID)
-				s.attachConn(sessionID, event.Conn.(net.Conn))
-				event.Resp <- resp
-			case "request":
-				resp := s.engine.Handle(event.Request, event.SessionID)
-				s.sendToSession(event.SessionID, resp)
-				s.broadcastRoomStates()
-			case "disconnect":
-				s.engine.Disconnect(event.SessionID)
-				s.unregister(event.SessionID)
-				s.broadcastRoomStates()
-			case "tick":
-				s.engine.Tick()
-				s.broadcastRoomStates()
-			}
+			s.handleEvent(event)
 		}
+	}
+}
+
+func (s *Server) handleEvent(event ClientEvent) {
+	switch event.Kind {
+	case "hello":
+		sessionID, resp := s.engine.Hello(event.PlayerID)
+		s.attachConn(sessionID, event.Conn.(*serverClient))
+		event.Resp <- resp
+	case "request":
+		resp := s.engine.Handle(event.Request, event.SessionID)
+		s.sendToSession(event.SessionID, resp)
+		s.sendNotifications(event.SessionID)
+	case "disconnect":
+		s.engine.Disconnect(event.SessionID)
+		s.unregister(event.SessionID)
+		s.sendNotifications("")
+	case "tick":
+		s.engine.Tick()
+		s.sendNotifications("")
 	}
 }
 
 func (s *Server) tickLoop() {
 	defer s.wg.Done()
-	ticker := time.NewTicker(50 * time.Millisecond)
+	ticker := time.NewTicker(s.tickInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-s.done:
 			return
 		case <-ticker.C:
-			s.ch <- ClientEvent{Kind: "tick"}
+			select {
+			case s.ch <- ClientEvent{Kind: "tick"}:
+			case <-s.done:
+				return
+			}
 		}
 	}
 }
@@ -87,86 +134,149 @@ func (s *Server) tickLoop() {
 func (s *Server) unregister(sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.conns, sessionID)
+	delete(s.clients, sessionID)
 }
 
 func (s *Server) sendToSession(sessionID string, resp Response) {
 	s.mu.Lock()
-	conn := s.conns[sessionID]
+	client := s.clients[sessionID]
 	s.mu.Unlock()
-	if conn != nil {
-		_ = encode(conn, resp)
+	if client != nil {
+		select {
+		case client.ch <- resp:
+		default:
+			_ = client.conn.Close()
+		}
 	}
 }
 
-func (s *Server) sendToPlayer(player string, resp Response) {
-	sessionID := s.engine.CurrentSession(player)
-	if sessionID != "" {
-		s.sendToSession(sessionID, resp)
-	}
-}
-
-func (s *Server) broadcastRoomStates() {
-	for player, state := range s.engine.PublicRoomStates() {
-		s.sendToPlayer(player, state)
+func (s *Server) sendNotifications(skipSession string) {
+	for player, state := range s.engine.Notifications() {
+		sessionID := s.engine.CurrentSession(player)
+		if sessionID == "" || sessionID == skipSession {
+			continue
+		}
+		s.sendToSession(sessionID, state)
 	}
 }
 
 func (s *Server) Serve() {
+	if s.listener == nil {
+		return
+	}
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
 			return
 		}
-		s.wg.Add(1)
-		go s.serveConn(conn)
+		s.ServeConn(conn)
 	}
 }
 
+func (s *Server) ServeConn(conn net.Conn) {
+	s.connWg.Add(1)
+	go s.serveConn(conn)
+}
+
 func (s *Server) serveConn(conn net.Conn) {
-	defer s.wg.Done()
+	defer s.connWg.Done()
 	defer conn.Close()
+	client := &serverClient{conn: conn, ch: make(chan Response, 64)}
+	writerDone := make(chan struct{})
+	stopWriter := make(chan struct{})
+	var writerOnce sync.Once
+	stop := func() { writerOnce.Do(func() { close(stopWriter) }) }
+	defer stop()
+	go func() {
+		defer close(writerDone)
+		for {
+			select {
+			case <-stopWriter:
+				return
+			case resp := <-client.ch:
+				if s.encode(conn, resp) != nil {
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+	}()
+	defer func() { _ = conn.Close(); stop(); <-writerDone }()
 	reader := bufio.NewReader(conn)
 	var sessionID string
 	defer func() {
-		if sessionID != "" {
-			s.ch <- ClientEvent{Kind: "disconnect", SessionID: sessionID}
+		if sessionID == "" {
+			return
 		}
+		event := ClientEvent{Kind: "disconnect", SessionID: sessionID}
+		go func() {
+			select {
+			case s.ch <- event:
+			case <-s.done:
+			}
+		}()
 	}()
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			var req Request
 			if json.Unmarshal(line, &req) != nil {
-				_ = encode(conn, Response{Type: "error", OK: false, Reason: "bad_json"})
+				s.sendToConn(client, Response{Type: "error", OK: false, Reason: "bad_json"})
 			} else if req.Type == "hello" {
-				event := ClientEvent{Kind: "hello", PlayerID: req.PlayerID, Conn: conn, Resp: make(chan Response, 1)}
-				s.ch <- event
-				resp := <-event.Resp
-				sessionID = resp.SessionID
-				_ = encode(conn, resp)
+				event := ClientEvent{Kind: "hello", PlayerID: req.PlayerID, Conn: client, Resp: make(chan Response, 1)}
+				if !s.submit(event) {
+					return
+				}
+				select {
+				case resp := <-event.Resp:
+					sessionID = resp.SessionID
+					s.sendToConn(client, resp)
+				case <-s.done:
+					return
+				}
 			} else if req.SessionID != sessionID {
-				_ = encode(conn, Response{Type: "error", OK: false, Reason: "stale_session"})
-			} else {
-				s.ch <- ClientEvent{Kind: "request", SessionID: sessionID, Request: req}
+				s.sendToConn(client, Response{Type: "error", OK: false, Reason: "stale_session"})
+			} else if !s.submit(ClientEvent{Kind: "request", SessionID: sessionID, Request: req}) {
+				return
 			}
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				log.Printf("connection: %v", err)
+				select {
+				case <-s.done:
+				default:
+					log.Printf("connection: %v", err)
+				}
 			}
 			return
 		}
 	}
 }
 
-func (s *Server) attachConn(sessionID string, conn net.Conn) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.conns[sessionID] = conn
+func (s *Server) submit(event ClientEvent) bool {
+	select {
+	case s.ch <- event:
+		return true
+	case <-s.done:
+		return false
+	}
 }
 
-func encode(conn net.Conn, resp Response) error {
+func (s *Server) attachConn(sessionID string, client *serverClient) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clients[sessionID] = client
+}
+
+func (s *Server) sendToConn(client *serverClient, resp Response) {
+	select {
+	case client.ch <- resp:
+	default:
+		_ = client.conn.Close()
+	}
+}
+
+func (s *Server) encode(conn net.Conn, resp Response) error {
 	data, err := json.Marshal(resp)
 	if err != nil {
 		return err

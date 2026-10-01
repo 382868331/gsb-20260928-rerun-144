@@ -66,6 +66,9 @@ func TestMatchConfirmDisconnectRefillAndRestart(t *testing.T) {
 	if restored == nil || restored.Status != StatusActive || restored.Members["p3"] == nil || restored.Members["p1"] != nil {
 		t.Fatalf("restored room = %#v", restored)
 	}
+	if record := restarted.SessionRecord(sessions["p3"]); record.Result != StatusActive || record.RoomID != roomID {
+		t.Fatalf("restored session record = %#v", record)
+	}
 }
 
 func TestStaleSessionCannotConfirm(t *testing.T) {
@@ -112,5 +115,26 @@ func TestIncompatibleEarlierPlayerDoesNotBlockLaterMatch(t *testing.T) {
 	resp := engine.Handle(queueReq("p3", 11, 2), s3)
 	if resp.Type != "invited" {
 		t.Fatalf("compatible later players not matched: %#v", resp)
+	}
+}
+
+func TestRefilledInvitationGetsFreshDeadline(t *testing.T) {
+	engine, now := testEngine(t)
+	s1, _ := engine.Hello("p1")
+	s2, _ := engine.Hello("p2")
+	s3, _ := engine.Hello("p3")
+	engine.Handle(queueReq("p1", 10, 2), s1)
+	roomID := engine.Handle(queueReq("p2", 11, 2), s2).RoomID
+	engine.Handle(Request{Type: "confirm", PlayerID: "p1", RoomID: roomID}, s1)
+	engine.Handle(Request{Type: "confirm", PlayerID: "p2", RoomID: roomID}, s2)
+	engine.Handle(queueReq("p3", 12, 2), s3)
+	originalDeadline := engine.rooms[roomID].DeadlineUnixMS
+	engine.Disconnect(s2)
+	refillDeadline := engine.rooms[roomID].DeadlineUnixMS
+	if refillDeadline <= originalDeadline {
+		t.Fatalf("refill deadline %d was not refreshed from %d", refillDeadline, originalDeadline)
+	}
+	if refillDeadline != now.Add(10*time.Second).UnixMilli() {
+		t.Fatalf("refill deadline = %d", refillDeadline)
 	}
 }

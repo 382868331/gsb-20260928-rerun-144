@@ -35,10 +35,11 @@ type RoomRecord struct {
 }
 
 type persistedState struct {
-	Version int           `json:"version"`
-	NextSeq int64         `json:"next_seq"`
-	Queue   []QueueRecord `json:"queue"`
-	Rooms   []RoomRecord  `json:"rooms"`
+	Version        int              `json:"version"`
+	NextSeq        int64            `json:"next_seq"`
+	Queue          []QueueRecord    `json:"queue"`
+	Rooms          []RoomRecord     `json:"rooms"`
+	SessionRecords []*SessionRecord `json:"session_records,omitempty"`
 }
 
 type Store struct {
@@ -47,7 +48,7 @@ type Store struct {
 
 func NewStore(path string) *Store { return &Store{path: path} }
 
-func (s *Store) Save(nextSeq int64, queue []QueueRecord, rooms map[string]*Room) error {
+func (s *Store) Save(nextSeq int64, queue []QueueRecord, rooms map[string]*Room, sessionRecords map[string]*SessionRecord) error {
 	records := make([]RoomRecord, 0, len(rooms))
 	for _, room := range rooms {
 		members := make(map[string]MemberRecord, len(room.Members))
@@ -61,7 +62,13 @@ func (s *Store) Save(nextSeq int64, queue []QueueRecord, rooms map[string]*Room)
 		})
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
-	data, err := json.MarshalIndent(persistedState{Version: StateVersion, NextSeq: nextSeq, Queue: append([]QueueRecord(nil), queue...), Rooms: records}, "", "  ")
+	recordList := make([]*SessionRecord, 0, len(sessionRecords))
+	for _, record := range sessionRecords {
+		recordList = append(recordList, record)
+	}
+	sort.Slice(recordList, func(i, j int) bool { return recordList[i].SessionID < recordList[j].SessionID })
+	data, err := json.MarshalIndent(persistedState{Version: StateVersion, NextSeq: nextSeq,
+		Queue: append([]QueueRecord(nil), queue...), Rooms: records, SessionRecords: recordList}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -86,20 +93,20 @@ func (s *Store) Save(nextSeq int64, queue []QueueRecord, rooms map[string]*Room)
 	return os.Rename(tmpName, s.path)
 }
 
-func (s *Store) Load(nowMS int64, proposalTTLMS int64) (int64, []QueueRecord, map[string]*Room, error) {
+func (s *Store) Load(nowMS int64, proposalTTLMS int64) (int64, []QueueRecord, map[string]*Room, map[string]*SessionRecord, error) {
 	data, err := os.ReadFile(s.path)
 	if os.IsNotExist(err) {
-		return 1, nil, map[string]*Room{}, nil
+		return 1, nil, map[string]*Room{}, map[string]*SessionRecord{}, nil
 	}
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, nil, err
 	}
 	var saved persistedState
 	if err := json.Unmarshal(data, &saved); err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, nil, err
 	}
 	if saved.Version != StateVersion {
-		return 0, nil, nil, fmt.Errorf("unsupported state version %d", saved.Version)
+		return 0, nil, nil, nil, fmt.Errorf("unsupported state version %d", saved.Version)
 	}
 	rooms := make(map[string]*Room, len(saved.Rooms))
 	queued := map[string]bool{}
@@ -114,11 +121,11 @@ func (s *Store) Load(nowMS int64, proposalTTLMS int64) (int64, []QueueRecord, ma
 			DeadlineUnixMS: rec.DeadlineUnixMS, EmptySinceUnixMS: rec.EmptySinceUnixMS}
 		for playerID, memberRec := range rec.Members {
 			if previous := occupied[playerID]; previous != "" {
-				return 0, nil, nil, fmt.Errorf("duplicate room occupancy for %s in %s and %s", playerID, previous, rec.ID)
+				return 0, nil, nil, nil, fmt.Errorf("duplicate room occupancy for %s in %s and %s", playerID, previous, rec.ID)
 			}
 			occupied[playerID] = rec.ID
 			if queued[playerID] {
-				return 0, nil, nil, fmt.Errorf("duplicate occupancy for %s", playerID)
+				return 0, nil, nil, nil, fmt.Errorf("duplicate occupancy for %s", playerID)
 			}
 			room.Members[playerID] = &Member{PlayerID: playerID, Status: memberRec.Status}
 		}
@@ -135,5 +142,11 @@ func (s *Store) Load(nowMS int64, proposalTTLMS int64) (int64, []QueueRecord, ma
 		rooms[room.ID] = room
 	}
 	sort.SliceStable(saved.Queue, func(i, j int) bool { return saved.Queue[i].Seq < saved.Queue[j].Seq })
-	return nextSeq, saved.Queue, rooms, nil
+	records := map[string]*SessionRecord{}
+	for _, record := range saved.SessionRecords {
+		if record != nil && record.SessionID != "" {
+			records[record.SessionID] = record
+		}
+	}
+	return nextSeq, saved.Queue, rooms, records, nil
 }

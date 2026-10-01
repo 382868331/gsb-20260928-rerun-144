@@ -4,92 +4,132 @@ import (
 	"bufio"
 	"encoding/json"
 	"flag"
-	"io"
+	"fmt"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"multiplayer-session-service/internal"
 )
 
-type client struct {
+type demoClient struct {
 	id       string
 	conn     net.Conn
 	session  string
 	room     string
-	status   string
-	waiting  []string
-	members  []string
-	messages []string
-	lastLine string
+	reader   *bufio.Reader
+	messages chan internal.Response
 }
 
 func main() {
 	statePath := flag.String("state", filepath.Join(os.TempDir(), "multiplayer-session-demo.json"), "state file")
-	proposalTTL := flag.Duration("proposal-ttl", 10*time.Second, "proposal TTL")
-	emptyTTL := flag.Duration("empty-ttl", 15*time.Second, "vacancy TTL")
+	proposalTTL := flag.Duration("proposal-ttl", 250*time.Millisecond, "proposal TTL")
+	emptyTTL := flag.Duration("empty-ttl", 500*time.Millisecond, "vacancy TTL")
 	flag.Parse()
 	_ = os.Remove(*statePath)
 
 	addr, shutdown := startServer(*statePath, *proposalTTL, *emptyTTL)
-	defer shutdown()
 
-	p1 := dial("p1", addr)
-	p2 := dial("p2", addr)
-	p3 := dial("p3", addr)
-	defer closeAll(p1, p2, p3)
+	p1 := dial(addr, "p1")
+	p2 := dial(addr, "p2")
+	p3 := dial(addr, "p3")
+	p4 := dial(addr, "p4")
+	p5 := dial(addr, "p5")
+	p6 := dial(addr, "p6")
+	closeClients := func(clients ...*demoClient) {
+		for _, client := range clients {
+			_ = client.conn.Close()
+		}
+	}
+	defer closeClients(p1, p2, p3, p5, p6)
 
-	readUntil(p1, "hello")
-	readUntil(p2, "hello")
-	readUntil(p3, "hello")
-	p1.send("queue", 10, 2, "")
-	time.Sleep(50 * time.Millisecond)
-	p2.send("queue", 11, 2, "")
-	readUntil(p1, "invited")
-	readUntil(p2, "invited")
+	expect(p1, "hello")
+	expect(p2, "hello")
+	expect(p3, "hello")
+	expect(p4, "hello")
+	expect(p5, "hello")
+	expect(p6, "hello")
+
+	log.Println("send a fragmented queue request")
+	p1.writeParts(`{"type":"queue","session_id":"`, p1.session, `","player_id":"p1","mode":"ranked","level":10,"room_size":2}`, "\n")
+	expect(p1, "queued")
+
+	log.Println("send coalesced queue and reject-from-nowhere requests")
+	p2.writeRaw(`{"type":"queue","session_id":"` + p2.session + `","player_id":"p2","mode":"ranked","level":11,"room_size":2}` + "\n" +
+		`{"type":"reject","session_id":"` + p2.session + `","player_id":"p2","room_id":"room-old"}` + "\n")
+	expect(p2, "invited")
+	staleRoom := p2.room
+	expect(p2, "error")
+	expect(p1, "invited")
+
 	p1.send("confirm", 0, 0, p1.room)
-	p2.send("confirm", 0, 0, p2.room)
-	readUntil(p1, "confirmed")
-	readUntil(p2, "confirmed")
+	p2.send("reject", 0, 0, p2.room)
+	expect(p2, "rejected")
+	expect(p1, "canceled")
+	log.Println("rejection dissolved the proposal and gave both members final results")
 
-	p3.send("queue", 12, 2, "")
-	readUntil(p3, "queued")
-	log.Println("p2 disconnects; released slot is offered to waiting p3")
-	_ = p2.conn.Close()
-	readUntil(p1, "room_state")
-	readUntil(p3, "room_state")
+	log.Println("queue and cancel before a match arrives, then requeue in one write")
+	p3.writeRaw(`{"type":"queue","session_id":"` + p3.session + `","player_id":"p3","mode":"ranked","level":10,"room_size":2}` + "\n" +
+		`{"type":"cancel","session_id":"` + p3.session + `","player_id":"p3"}` + "\n")
+	expect(p3, "queued")
+	expect(p3, "canceled")
+	p3.send("queue", 10, 2, "")
+	expect(p3, "queued")
+
+	p4.send("queue", 11, 2, "")
+	expect(p4, "invited")
+	expect(p3, "invited")
 	p3.send("confirm", 0, 0, p3.room)
-	readUntil(p3, "confirmed")
-	time.Sleep(100 * time.Millisecond)
+	p4.send("confirm", 0, 0, p4.room)
+	expect(p3, "confirmed")
+	expect(p4, "confirmed")
+
+	p5.send("queue", 12, 2, "")
+	expect(p5, "queued")
+	log.Println("p4 exits while p5 is waiting; p5 must be invited into the released slot")
+	_ = p4.conn.Close()
+	expect(p3, "room_state")
+	expect(p5, "invited")
+	p5.send("confirm", 0, 0, p5.room)
+	expect(p5, "confirmed")
+
+	log.Println("a queued client can cancel; coalesced arrival preserves both request results")
+	p6.writeRaw(`{"type":"queue","session_id":"` + p6.session + `","player_id":"p6","mode":"ranked","level":11,"room_size":2}` + "\n" +
+		`{"type":"cancel","session_id":"` + p6.session + `","player_id":"p6"}` + "\n")
+	expect(p6, "queued")
+	expect(p6, "canceled")
+
+	log.Println("old invitation confirmation cannot act on a different new room")
+	p6.send("queue", 20, 2, "")
+	expect(p6, "queued")
+	p2.send("queue", 20, 2, "")
+	resp := expect(p2, "invited")
+	newRoom := resp.RoomID
+	expect(p6, "invited")
+	if newRoom == staleRoom {
+		log.Fatalf("new match reused stale room %s", staleRoom)
+	}
+	p2.send("confirm", 0, 0, staleRoom)
+	expect(p2, "error")
+	p2.send("confirm", 0, 0, newRoom)
+	expect(p6, "confirmed")
+	expect(p2, "confirmed")
+
 	shutdown()
-
-	log.Println("server restarts from saved state")
+	log.Println("restart server and resume both completed rooms from saved state")
 	addr, shutdown = startServer(*statePath, *proposalTTL, *emptyTTL)
-	defer shutdown()
-	p1.reconnect(addr)
+	p2.reconnect(addr)
 	p3.reconnect(addr)
-	resumedP1 := readUntil(p1, "resumed")
-	resumedP3 := readUntil(p3, "resumed")
-	if resumedP1.room != resumedP3.room {
-		log.Fatalf("restarted players are in different rooms: %s %s", resumedP1.room, resumedP3.room)
-	}
-
-	p4 := dial("p4", addr)
-	defer p4.close()
-	readUntil(p4, "hello")
-	old := p4.session
-	p4.hello()
-	readUntil(p4, "hello")
-	p4.sendRaw(map[string]string{"type": "queue", "session_id": old, "player_id": "p4", "mode": "ranked"})
-	stale := readUntil(p4, "error")
-	if stale.reason() != "stale_session" {
-		log.Fatalf("old session was accepted: %s", stale.lastLine)
-	}
-
-	log.Printf("demo complete: room %s contains confirmed %v", resumedP1.room, resumedP1.members)
+	p5.reconnect(addr)
+	p6.reconnect(addr)
+	expect(p2, "resumed")
+	expect(p3, "resumed")
+	expect(p5, "resumed")
+	expect(p6, "resumed")
+	shutdown()
+	log.Printf("demo complete; state saved at %s", *statePath)
 }
 
 func startServer(statePath string, proposalTTL, emptyTTL time.Duration) (string, func()) {
@@ -97,6 +137,7 @@ func startServer(statePath string, proposalTTL, emptyTTL time.Duration) (string,
 	if err != nil {
 		log.Fatal(err)
 	}
+	engine.SetTimeouts(proposalTTL, emptyTTL)
 	server, err := internal.NewServer(engine, "127.0.0.1:0")
 	if err != nil {
 		log.Fatal(err)
@@ -105,32 +146,56 @@ func startServer(statePath string, proposalTTL, emptyTTL time.Duration) (string,
 	return server.Address(), func() { _ = server.Close() }
 }
 
-func dial(id, addr string) *client {
+func dial(addr, id string) *demoClient {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		log.Fatal(err)
 	}
-	c := &client{id: id, conn: conn}
-	c.hello()
-	return c
+	client := &demoClient{id: id, conn: conn, reader: bufio.NewReader(conn), messages: make(chan internal.Response, 32)}
+	go client.readLoop()
+	client.hello()
+	return client
 }
 
-func (c *client) reconnect(addr string) {
+func (c *demoClient) reconnect(addr string) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		log.Fatal(err)
 	}
 	c.conn = conn
 	c.room = ""
-	c.status = ""
+	c.reader = bufio.NewReader(conn)
+	c.messages = make(chan internal.Response, 32)
+	go c.readLoop()
 	c.hello()
 }
 
-func (c *client) hello() {
-	c.sendRaw(map[string]string{"type": "hello", "player_id": c.id})
+func (c *demoClient) readLoop() {
+	for {
+		line, err := c.reader.ReadBytes('\n')
+		if len(line) > 0 {
+			var resp internal.Response
+			if json.Unmarshal(line, &resp) == nil {
+				if resp.SessionID != "" {
+					c.session = resp.SessionID
+				}
+				if resp.RoomID != "" {
+					c.room = resp.RoomID
+				}
+				c.messages <- resp
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
-func (c *client) send(kind string, level, size int, roomID string) {
+func (c *demoClient) hello() {
+	c.writeRaw(`{"type":"hello","player_id":"` + c.id + `"}`)
+}
+
+func (c *demoClient) send(kind string, level, size int, roomID string) {
 	req := map[string]interface{}{"type": kind, "session_id": c.session, "player_id": c.id}
 	if level != 0 {
 		req["level"] = level
@@ -141,60 +206,33 @@ func (c *client) send(kind string, level, size int, roomID string) {
 	if roomID != "" {
 		req["room_id"] = roomID
 	}
-	c.sendRaw(req)
-}
-
-func (c *client) sendRaw(req interface{}) {
 	data, _ := json.Marshal(req)
-	if _, err := c.conn.Write(append(data, '\n')); err != nil {
-		log.Fatal(err)
+	c.writeRaw(string(data))
+}
+
+func (c *demoClient) writeRaw(message string) {
+	if _, err := fmt.Fprint(c.conn, message); err != nil {
+		log.Fatalf("%s write: %v", c.id, err)
 	}
 }
 
-func readUntil(c *client, kind string) *client {
-	reader := bufio.NewReader(c.conn)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil && err != io.EOF {
-			log.Fatal(err)
-		}
-		if line == "" {
-			log.Fatalf("%s closed while waiting for %s", c.id, kind)
-		}
-		var resp internal.Response
-		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &resp); err != nil {
-			log.Fatal(err)
-		}
-		c.lastLine = line
-		if resp.SessionID != "" {
-			c.session = resp.SessionID
-		}
-		if resp.RoomID != "" {
-			c.room = resp.RoomID
-		}
-		if resp.Status != "" {
-			c.status = resp.Status
-		}
-		c.waiting = resp.Waiting
-		c.members = resp.Members
-		if resp.Reason != "" {
-			c.messages = append(c.messages, resp.Reason)
-		}
-		if resp.Type == kind {
-			return c
+func (c *demoClient) writeParts(parts ...string) {
+	for _, part := range parts {
+		if _, err := fmt.Fprint(c.conn, part); err != nil {
+			log.Fatalf("%s write: %v", c.id, err)
 		}
 	}
 }
 
-func (c *client) reason() string {
-	if len(c.messages) == 0 {
-		return ""
-	}
-	return c.messages[len(c.messages)-1]
-}
-func (c *client) close() { _ = c.conn.Close() }
-func closeAll(clients ...*client) {
-	for _, c := range clients {
-		c.close()
+func expect(client *demoClient, typ string) internal.Response {
+	select {
+	case resp := <-client.messages:
+		if resp.Type != typ {
+			log.Fatalf("%s expected %s, got %s (%s)", client.id, typ, resp.Type, resp.Reason)
+		}
+		return resp
+	case <-time.After(2 * time.Second):
+		log.Fatalf("%s timed out waiting for %s", client.id, typ)
+		return internal.Response{}
 	}
 }
