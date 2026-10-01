@@ -81,6 +81,65 @@ func TestStaleSessionCannotConfirm(t *testing.T) {
 	}
 }
 
+func TestOldInvitationCannotConfirmRematchedRoom(t *testing.T) {
+	engine, now := testEngine(t)
+	s1, _ := engine.Hello("p1")
+	s2, _ := engine.Hello("p2")
+	engine.Handle(queueReq("p1", 10, 2), s1)
+	first := engine.Handle(queueReq("p2", 11, 2), s2)
+	if first.Type != "invited" || first.RoomID != "room-1" {
+		t.Fatalf("first invitation = %#v", first)
+	}
+	engine.Handle(Request{Type: "reject", PlayerID: "p2", RoomID: first.RoomID}, s2)
+	*now = now.Add(11 * time.Second)
+	engine.Tick()
+
+	s3, _ := engine.Hello("p3")
+	s4, _ := engine.Hello("p4")
+	engine.Handle(queueReq("p3", 20, 2), s3)
+	second := engine.Handle(queueReq("p4", 21, 2), s4)
+	if second.Type != "invited" || second.RoomID != "room-2" {
+		t.Fatalf("second invitation = %#v", second)
+	}
+	resp := engine.Handle(Request{Type: "confirm", PlayerID: "p1", RoomID: first.RoomID}, s1)
+	if resp.Type != "error" || resp.Reason != "not_invited" {
+		t.Fatalf("old invite confirmation = %#v", resp)
+	}
+	if room := engine.rooms[second.RoomID]; room.Members["p1"] != nil {
+		t.Fatalf("old invitation inserted p1 into new room: %#v", room.Members)
+	}
+}
+
+func TestResultsPersistAndShutdownClearsWaiters(t *testing.T) {
+	engine, now := testEngine(t)
+	s1, _ := engine.Hello("p1")
+	s2, _ := engine.Hello("p2")
+	s3, _ := engine.Hello("p3")
+	engine.Handle(queueReq("p1", 10, 2), s1)
+	room := engine.Handle(queueReq("p2", 11, 2), s2)
+	engine.Handle(Request{Type: "confirm", PlayerID: "p1", RoomID: room.RoomID}, s1)
+	engine.Handle(Request{Type: "confirm", PlayerID: "p2", RoomID: room.RoomID}, s2)
+	engine.Handle(queueReq("p3", 20, 2), s3)
+	canceled := engine.Shutdown()
+	if len(canceled) != 1 || canceled[0] != "p3" {
+		t.Fatalf("shutdown canceled = %v", canceled)
+	}
+	if len(engine.queue) != 0 || engine.Result("p3") != StatusCanceled {
+		t.Fatalf("waiting state after shutdown: queue=%v result=%q", engine.queue, engine.Result("p3"))
+	}
+
+	restarted, err := NewEngine(engine.store, func() time.Time { return *now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Result("p1") != StatusActive || restarted.Result("p2") != StatusActive {
+		t.Fatalf("persisted results = p1:%q p2:%q", restarted.Result("p1"), restarted.Result("p2"))
+	}
+	if restarted.nextRoom != 2 || len(restarted.queue) != 0 {
+		t.Fatalf("restart state = nextRoom:%d queue:%v", restarted.nextRoom, restarted.queue)
+	}
+}
+
 func TestProposalTimeoutReturnsPlayersToQueue(t *testing.T) {
 	engine, now := testEngine(t)
 	s1, _ := engine.Hello("p1")
