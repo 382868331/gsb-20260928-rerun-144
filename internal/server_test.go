@@ -29,13 +29,13 @@ type tcpClient struct {
 	session string
 }
 
-func startTestServer(t *testing.T, proposalTTL, emptyTTL time.Duration) (*Server, *Engine) {
+func startTestServer(t *testing.T, proposalTTL, emptyTTL, reserveTTL time.Duration) (*Server, *Engine) {
 	t.Helper()
 	engine, err := NewEngine(NewStore(filepath.Join(t.TempDir(), "state.json")), time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine.SetTimeouts(proposalTTL, emptyTTL)
+	engine.SetTimeouts(proposalTTL, emptyTTL, reserveTTL)
 	server, err := NewServer(engine, "127.0.0.1:0")
 	skipWithoutListen(t, err)
 	t.Cleanup(func() { _ = server.Close() })
@@ -132,8 +132,21 @@ func (c *tcpClient) readUntil(kinds ...string) Response {
 
 func (c *tcpClient) close() { _ = c.conn.Close() }
 
+func (c *tcpClient) readUntilStatus(kind, status string) Response {
+	c.t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		resp := c.readUntil(kind)
+		if resp.Status == status {
+			return resp
+		}
+	}
+	c.t.Fatalf("%s never saw %s with status %s", c.id, kind, status)
+	return Response{}
+}
+
 func TestTCPFragmentedAndMergedMessagesConfirmExitRefill(t *testing.T) {
-	server, engine := startTestServer(t, time.Second, 2*time.Second)
+	server, engine := startTestServer(t, time.Second, 2*time.Second, 300*time.Millisecond)
 	p1 := dialTCP(t, server.Address(), "p1")
 	p2 := dialTCP(t, server.Address(), "p2")
 	p3 := dialTCP(t, server.Address(), "p3")
@@ -150,17 +163,21 @@ func TestTCPFragmentedAndMergedMessagesConfirmExitRefill(t *testing.T) {
 		map[string]interface{}{"type": "snapshot"},
 	)
 	p2.requestFragments(map[string]interface{}{"type": "confirm", "room_id": second.RoomID}, 7)
-	if resp := p1.readUntil("confirmed"); resp.Status != StatusActive {
-		t.Fatalf("p1 final confirm = %#v", resp)
-	}
-	if resp := p2.readUntil("confirmed"); resp.Status != StatusActive {
-		t.Fatalf("p2 final confirm = %#v", resp)
-	}
+	p1.readUntilStatus("confirmed", StatusActive)
+	p2.readUntilStatus("confirmed", StatusActive)
+	p1.writeCombined(
+		map[string]interface{}{"type": "confirm", "room_id": first.RoomID},
+		map[string]interface{}{"type": "confirm", "room_id": first.RoomID},
+	)
+	p1.readUntilStatus("confirmed", StatusActive)
 
 	p3.request(map[string]interface{}{"type": "queue", "mode": "ranked", "level": 12, "room_size": 2})
 	p3.readUntil("queued")
 	p2.close()
-	p1.readUntil("room_state")
+	if state := p1.readUntil("room_state"); len(state.Reserved) != 1 || state.Reserved[0] != "p2" || state.Status != StatusActive {
+		t.Fatalf("p2 seat was not reserved: %#v", state)
+	}
+	time.Sleep(500 * time.Millisecond)
 	refill := p3.readUntil("invited")
 	if refill.RoomID != first.RoomID || refill.Reason != StatusInvited {
 		t.Fatalf("p3 refill invitation = %#v", refill)
@@ -179,7 +196,7 @@ func TestTCPFragmentedAndMergedMessagesConfirmExitRefill(t *testing.T) {
 }
 
 func TestTCPCancelledWaitersAreWokenOnClose(t *testing.T) {
-	server, engine := startTestServer(t, time.Second, 2*time.Second)
+	server, engine := startTestServer(t, time.Second, 2*time.Second, time.Second)
 	p1 := dialTCP(t, server.Address(), "p1")
 	p2 := dialTCP(t, server.Address(), "p2")
 	p1.request(map[string]interface{}{"type": "queue", "mode": "ranked", "level": 1, "room_size": 2})
@@ -208,7 +225,7 @@ func TestTCPCancelledWaitersAreWokenOnClose(t *testing.T) {
 }
 
 func TestTCPOldInvitationCannotConfirmNewRoom(t *testing.T) {
-	server, _ := startTestServer(t, 60*time.Millisecond, time.Second)
+	server, _ := startTestServer(t, 60*time.Millisecond, time.Second, time.Second)
 	p1 := dialTCP(t, server.Address(), "p1")
 	p2 := dialTCP(t, server.Address(), "p2")
 	p1.request(map[string]interface{}{"type": "queue", "mode": "ranked", "level": 10, "room_size": 2})

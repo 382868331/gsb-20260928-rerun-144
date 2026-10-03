@@ -16,6 +16,7 @@ func testEngine(t *testing.T) (*Engine, *time.Time) {
 	}
 	engine.proposalTTL = 10 * time.Second
 	engine.emptyTTL = 15 * time.Second
+	engine.reserveTTL = 5 * time.Second
 	return engine, &now
 }
 
@@ -49,6 +50,15 @@ func TestMatchConfirmDisconnectRefillAndRestart(t *testing.T) {
 	}
 	engine.Disconnect(sessions["p1"])
 	room := engine.rooms[roomID]
+	if room == nil || room.Members["p1"] == nil || room.Members["p1"].ReservedUntilUnixMS == 0 {
+		t.Fatalf("confirmed disconnect was not reserved: %#v", room)
+	}
+	if room.Members["p3"] != nil {
+		t.Fatalf("reserved seat was backfilled early: %#v", room.Members)
+	}
+	*now = now.Add(6 * time.Second)
+	engine.Tick()
+	room = engine.rooms[roomID]
 	if room == nil || room.Members["p3"] == nil || room.Members["p3"].Status != StatusInvited {
 		t.Fatalf("p3 was not offered released slot: %#v", room)
 	}
@@ -171,5 +181,148 @@ func TestIncompatibleEarlierPlayerDoesNotBlockLaterMatch(t *testing.T) {
 	resp := engine.Handle(queueReq("p3", 11, 2), s3)
 	if resp.Type != "invited" {
 		t.Fatalf("compatible later players not matched: %#v", resp)
+	}
+}
+
+func activeRoom(t *testing.T, engine *Engine, players ...string) (string, map[string]string) {
+	t.Helper()
+	sessions := map[string]string{}
+	for _, player := range players {
+		session, _ := engine.Hello(player)
+		sessions[player] = session
+	}
+	roomID := ""
+	for i, player := range players {
+		resp := engine.Handle(queueReq(player, 10+i, len(players)), sessions[player])
+		if i < len(players)-1 {
+			continue
+		}
+		if resp.Type != "invited" {
+			t.Fatalf("last player not invited: %#v", resp)
+		}
+		roomID = resp.RoomID
+	}
+	for _, player := range players {
+		engine.Handle(Request{Type: "confirm", PlayerID: player, RoomID: roomID}, sessions[player])
+	}
+	if room := engine.rooms[roomID]; room == nil || room.Status != StatusActive {
+		t.Fatalf("room not active: %#v", room)
+	}
+	return roomID, sessions
+}
+
+func TestDuplicateConfirmConvergesToFinalStatus(t *testing.T) {
+	engine, _ := testEngine(t)
+	roomID, sessions := activeRoom(t, engine, "p1", "p2")
+	resp := engine.Handle(Request{Type: "confirm", PlayerID: "p1", RoomID: roomID}, sessions["p1"])
+	if resp.Type != "confirmed" || !resp.OK || resp.Status != StatusActive {
+		t.Fatalf("duplicate confirm = %#v", resp)
+	}
+	if room := engine.rooms[roomID]; room.Status != StatusActive {
+		t.Fatalf("duplicate confirm regressed room: %#v", room)
+	}
+}
+
+func TestReconnectWithinReserveKeepsSeat(t *testing.T) {
+	engine, now := testEngine(t)
+	roomID, sessions := activeRoom(t, engine, "p1", "p2")
+	engine.Disconnect(sessions["p1"])
+	room := engine.rooms[roomID]
+	if room.Members["p1"] == nil || room.Members["p1"].ReservedUntilUnixMS == 0 {
+		t.Fatalf("seat not reserved: %#v", room.Members)
+	}
+	*now = now.Add(2 * time.Second)
+	engine.Tick()
+	if engine.rooms[roomID].Members["p1"] == nil {
+		t.Fatal("reserved seat released before deadline")
+	}
+	oldSession := sessions["p1"]
+	newSession, resp := engine.Hello("p1")
+	if resp.Type != "resumed" || resp.RoomID != roomID || resp.Status != StatusActive {
+		t.Fatalf("resume = %#v", resp)
+	}
+	if engine.rooms[roomID].Members["p1"].ReservedUntilUnixMS != 0 {
+		t.Fatal("reservation not cleared on reconnect")
+	}
+	engine.Disconnect(oldSession)
+	if engine.rooms[roomID].Members["p1"] == nil {
+		t.Fatal("late disconnect of old connection removed reconnected player")
+	}
+	*now = now.Add(10 * time.Second)
+	engine.Tick()
+	if engine.rooms[roomID].Members["p1"] == nil {
+		t.Fatal("seat released after successful reconnect")
+	}
+	_ = newSession
+}
+
+func TestReservationExpiryReleasesSeatToWaiter(t *testing.T) {
+	engine, now := testEngine(t)
+	roomID, sessions := activeRoom(t, engine, "p1", "p2")
+	s3, _ := engine.Hello("p3")
+	engine.Handle(queueReq("p3", 11, 2), s3)
+	engine.Disconnect(sessions["p2"])
+	engine.Tick()
+	if engine.rooms[roomID].Members["p3"] != nil {
+		t.Fatal("reserved seat backfilled before expiry")
+	}
+	*now = now.Add(6 * time.Second)
+	engine.Tick()
+	room := engine.rooms[roomID]
+	if room.Members["p2"] != nil || room.Members["p3"] == nil || room.Members["p3"].Status != StatusInvited {
+		t.Fatalf("expired seat not backfilled: %#v", room.Members)
+	}
+	if _, resp := engine.Hello("p2"); resp.Type == "resumed" {
+		t.Fatal("expired seat still resumed")
+	}
+	resp := engine.Handle(Request{Type: "confirm", PlayerID: "p2", RoomID: roomID}, sessions["p2"])
+	if resp.Type != "error" {
+		t.Fatalf("late confirm after expiry = %#v", resp)
+	}
+	if engine.rooms[roomID].Members["p3"] == nil {
+		t.Fatal("late confirm affected new occupant")
+	}
+}
+
+func TestCompletedRoomIsNotReopenedAfterReservationsExpire(t *testing.T) {
+	engine, now := testEngine(t)
+	roomID, sessions := activeRoom(t, engine, "p1", "p2")
+	s3, _ := engine.Hello("p3")
+	engine.Handle(queueReq("p3", 11, 2), s3)
+	engine.Disconnect(sessions["p1"])
+	engine.Disconnect(sessions["p2"])
+	engine.Tick()
+	if engine.rooms[roomID].Members["p3"] != nil {
+		t.Fatal("waiter joined a fully reserved room")
+	}
+	*now = now.Add(6 * time.Second)
+	engine.Tick()
+	if engine.rooms[roomID] != nil {
+		t.Fatalf("completed room was reopened: %#v", engine.rooms[roomID])
+	}
+	if !engine.queued("p3") {
+		t.Fatal("waiter lost after room dissolution")
+	}
+	if engine.Result("p1") != StatusActive || engine.Result("p2") != StatusActive {
+		t.Fatalf("final decision erased: %q %q", engine.Result("p1"), engine.Result("p2"))
+	}
+}
+
+func TestStaleSessionCannotActAfterReconnect(t *testing.T) {
+	engine, _ := testEngine(t)
+	roomID, sessions := activeRoom(t, engine, "p1", "p2")
+	engine.Disconnect(sessions["p1"])
+	oldSession := sessions["p1"]
+	engine.Hello("p1")
+	resp := engine.Handle(Request{Type: "confirm", PlayerID: "p1", RoomID: roomID}, oldSession)
+	if resp.Reason != "stale_session" {
+		t.Fatalf("old session confirm = %#v", resp)
+	}
+	resp = engine.Handle(Request{Type: "cancel", PlayerID: "p1"}, oldSession)
+	if resp.Reason != "stale_session" {
+		t.Fatalf("old session cancel = %#v", resp)
+	}
+	if engine.rooms[roomID].Members["p1"] == nil {
+		t.Fatal("old connection acted on new identity")
 	}
 }

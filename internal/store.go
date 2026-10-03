@@ -19,7 +19,8 @@ type QueueRecord struct {
 }
 
 type MemberRecord struct {
-	Status string `json:"status"`
+	Status              string `json:"status"`
+	ReservedUntilUnixMS int64  `json:"reserved_until_unix_ms,omitempty"`
 }
 
 type RoomRecord struct {
@@ -54,7 +55,7 @@ func (s *Store) Save(nextSeq, nextRoom int64, queue []QueueRecord, rooms map[str
 	for _, room := range rooms {
 		members := make(map[string]MemberRecord, len(room.Members))
 		for id, member := range room.Members {
-			members[id] = MemberRecord{Status: member.Status}
+			members[id] = MemberRecord{Status: member.Status, ReservedUntilUnixMS: member.ReservedUntilUnixMS}
 		}
 		records = append(records, RoomRecord{
 			ID: room.ID, Mode: room.Mode, Level: room.Level, Size: room.Size,
@@ -122,7 +123,7 @@ func (s *Store) Load(nowMS int64, proposalTTLMS int64) (int64, int64, []QueueRec
 			if queued[playerID] {
 				return 0, 0, nil, nil, nil, fmt.Errorf("duplicate occupancy for %s", playerID)
 			}
-			room.Members[playerID] = &Member{PlayerID: playerID, Status: memberRec.Status}
+			room.Members[playerID] = &Member{PlayerID: playerID, Status: memberRec.Status, ReservedUntilUnixMS: memberRec.ReservedUntilUnixMS}
 		}
 		if room.Status == StatusProposed {
 			for playerID, member := range room.Members {

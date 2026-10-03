@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"multiplayer-session-service/internal"
@@ -29,11 +30,13 @@ func main() {
 	statePath := flag.String("state", filepath.Join(os.TempDir(), "multiplayer-session-demo.json"), "state file")
 	proposalTTL := flag.Duration("proposal-ttl", 400*time.Millisecond, "proposal TTL")
 	emptyTTL := flag.Duration("empty-ttl", 800*time.Millisecond, "vacancy TTL")
+	reserveTTL := flag.Duration("reserve-ttl", 500*time.Millisecond, "disconnect seat reservation TTL")
 	flag.Parse()
 	_ = os.Remove(*statePath)
 
-	addr, shutdown := startServer(*statePath, *proposalTTL, *emptyTTL)
+	addr, shutdown := startServer(*statePath, *proposalTTL, *emptyTTL, *reserveTTL)
 
+	log.Println("== phase 1: match, confirm convergence, duplicate confirms ==")
 	p1 := dial("p1", addr)
 	p2 := dial("p2", addr)
 	p3 := dial("p3", addr)
@@ -46,89 +49,110 @@ func main() {
 		log.Fatalf("p1 and p2 received different rooms: %s %s", first.RoomID, room.RoomID)
 	}
 	p1.confirmMerged(first.RoomID)
-	p2.confirmFragmented(first.RoomID)
 	if resp := p1.expect("confirmed"); resp.Status != internal.StatusProposed {
-		log.Fatalf("p1 confirmation = %#v", resp)
+		log.Fatalf("p1 first confirmation = %#v", resp)
 	}
-	if resp := p2.expect("confirmed"); resp.Status != internal.StatusActive {
-		log.Fatalf("matched room was not activated: %#v", resp)
+	p1.confirm(first.RoomID)
+	if resp := p1.expect("confirmed"); resp.Status != internal.StatusProposed {
+		log.Fatalf("p1 duplicate confirmation = %#v", resp)
 	}
+	p2.confirmFragmented(first.RoomID)
+	p1.expectStatus("confirmed", internal.StatusActive)
+	p2.expectStatus("confirmed", internal.StatusActive)
+	p1.expectRoomState(internal.StatusActive, nil, "p1", "p2")
+	log.Printf("room %s converged: every participant saw the final decision", first.RoomID)
 
+	log.Println("== phase 2: brief disconnect keeps the confirmed seat reserved ==")
 	p3.queue(12, 2)
 	p3.expect("queued")
-	log.Println("p2 exits while p3 is waiting")
+	oldP2Session := p2.session
 	_ = p2.conn.Close()
-	p1.expect("room_state")
+	time.Sleep(120 * time.Millisecond)
+	p1.expectRoomState(internal.StatusActive, []string{"p2"}, "p1", "p2")
+	p3.expectNone(200*time.Millisecond, "queued")
+	p2.reconnect(addr)
+	resumed := p2.expect("resumed")
+	if resumed.RoomID != first.RoomID || resumed.Status != internal.StatusActive {
+		log.Fatalf("p2 resume = %#v", resumed)
+	}
+	p3.expectNone(200*time.Millisecond, "queued")
+	log.Printf("p2 reclaimed the reserved seat in %s before %s", first.RoomID, *reserveTTL)
+
+	log.Println("== phase 3: reservation expires, waiting player backfills, late acts are rejected ==")
+	_ = p2.conn.Close()
+	time.Sleep(*reserveTTL + 250*time.Millisecond)
 	refill := p3.expect("invited")
 	if refill.RoomID != first.RoomID {
 		log.Fatalf("p3 was offered %s instead of %s", refill.RoomID, first.RoomID)
 	}
 	p3.confirmFragmented(refill.RoomID)
-	if resp := p3.expect("confirmed"); resp.Status != internal.StatusActive {
-		log.Fatalf("refill confirmation = %#v", resp)
-	}
+	p3.expectStatus("confirmed", internal.StatusActive)
+	p1.expectRoomState(internal.StatusActive, nil, "p1", "p3")
 
-	shutdown()
-	log.Println("server restarts and resumes the success record")
-	addr, shutdown = startServer(*statePath, *proposalTTL, *emptyTTL)
-	p1.reconnect(addr)
-	p3.reconnect(addr)
-	resumedP1 := p1.expect("resumed")
-	resumedP3 := p3.expect("resumed")
-	if resumedP1.RoomID != resumedP3.RoomID || resumedP1.RoomID != first.RoomID {
-		log.Fatalf("restarted room = %s %s, want %s", resumedP1.RoomID, resumedP3.RoomID, first.RoomID)
+	p2.reconnect(addr)
+	if resp := p2.expect("hello"); resp.RoomID != "" {
+		log.Fatalf("expired seat still resumed: %#v", resp)
 	}
+	p2.confirmWithSession(oldP2Session, first.RoomID)
+	if resp := p2.expect("error"); resp.Reason != "stale_session" {
+		log.Fatalf("old connection confirm = %#v", resp)
+	}
+	p2.confirm(first.RoomID)
+	if resp := p2.expect("error"); resp.Reason != "not_invited" {
+		log.Fatalf("late confirm after expiry = %#v", resp)
+	}
+	p1.expectRoomState(internal.StatusActive, nil, "p1", "p3")
+	log.Printf("seat in %s moved p2 -> p3; stale and late confirms changed nothing", first.RoomID)
 
+	log.Println("== phase 4: a fully vacated finished room is dissolved, never reopened ==")
+	_ = p1.conn.Close()
+	_ = p3.conn.Close()
+	time.Sleep(120 * time.Millisecond)
 	p4 := dial("p4", addr)
 	p5 := dial("p5", addr)
-	p6 := dial("p6", addr)
-	defer closeAll(p4, p5, p6)
-	p4.queue(30, 2)
-	p5.queue(31, 2)
-	old := p4.expect("invited")
+	defer closeAll(p4, p5)
+	p4.queue(11, 2)
+	p4.expect("queued")
+	p4.expectNone(*reserveTTL+150*time.Millisecond, "queued")
+	time.Sleep(250 * time.Millisecond)
+	p4.expectNone(200*time.Millisecond, "queued")
+	if snap := p4.snapshot(); contains(snap.Members, first.RoomID) {
+		log.Fatalf("finished room %s was reopened: %#v", first.RoomID, snap)
+	}
+	p5.queue(12, 2)
+	second := p4.expect("invited")
 	p5.expect("invited")
-	p5.reject(old.RoomID)
-	p5.expect("rejected")
-	time.Sleep(*proposalTTL + 150*time.Millisecond)
+	if second.RoomID == first.RoomID {
+		log.Fatalf("dissolved room id reused: %s", second.RoomID)
+	}
+	p4.confirm(second.RoomID)
+	p5.confirmFragmented(second.RoomID)
+	p4.expectStatus("confirmed", internal.StatusActive)
+	p5.expectStatus("confirmed", internal.StatusActive)
+	log.Printf("waiters formed fresh room %s instead of inheriting %s", second.RoomID, first.RoomID)
 
-	p6.queue(40, 2)
-	p5.queue(41, 2)
-	newRoom := p5.expect("invited")
-	p6.expect("invited")
-	if newRoom.RoomID == old.RoomID || newRoom.RoomID != "room-2" {
-		log.Fatalf("new room reused old id: old=%s new=%s", old.RoomID, newRoom.RoomID)
+	log.Println("== phase 5: restart keeps explaining the final decision ==")
+	shutdown()
+	addr, shutdown = startServer(*statePath, *proposalTTL, *emptyTTL, *reserveTTL)
+	defer shutdown()
+	p4.reconnect(addr)
+	p5.reconnect(addr)
+	resumedP4 := p4.expect("resumed")
+	resumedP5 := p5.expect("resumed")
+	if resumedP4.RoomID != second.RoomID || resumedP5.RoomID != second.RoomID ||
+		resumedP4.Status != internal.StatusActive || resumedP5.Status != internal.StatusActive {
+		log.Fatalf("restart resume = %#v %#v", resumedP4, resumedP5)
 	}
-	p4.confirm(old.RoomID)
-	if resp := p4.expect("error"); resp.Reason != "not_invited" {
-		log.Fatalf("old invitation affected new matching: %#v", resp)
-	}
-	p5.confirmFragmented(newRoom.RoomID)
-	p6.confirmMerged(newRoom.RoomID)
-	p5.expect("confirmed")
-	p6.expect("confirmed")
-
-	log.Println("closing while a fresh player is waiting must produce a final result")
-	p7 := dial("p7", addr)
-	defer p7.close()
-	p7.queue(99, 2)
-	p7.expect("queued")
-	closed := make(chan error, 1)
-	go func() { closed <- shutdownServer(addr, *statePath, *proposalTTL, *emptyTTL, shutdown) }()
-	if resp := p7.expect("canceled"); resp.Reason != "server_shutdown" {
-		log.Fatalf("waiting player result = %#v", resp)
-	}
-	if err := <-closed; err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("demo complete: success room %s contains %v", resumedP1.RoomID, resumedP1.Members)
+	results := readResults(*statePath)
+	log.Printf("demo complete: room %s holds %v; persisted final results %v", second.RoomID, resumedP4.Members, results)
 }
 
-func startServer(statePath string, proposalTTL, emptyTTL time.Duration) (string, func()) {
+func startServer(statePath string, proposalTTL, emptyTTL, reserveTTL time.Duration) (string, func()) {
 	engine, err := internal.NewEngine(internal.NewStore(statePath), nil)
 	if err != nil {
 		log.Fatal(err)
 	}
-	engine.SetTimeouts(proposalTTL, emptyTTL)
+	engine.SetTimeouts(proposalTTL, emptyTTL, reserveTTL)
 	server, err := internal.NewServer(engine, "127.0.0.1:0")
 	if err != nil {
 		log.Fatal(err)
@@ -137,9 +161,18 @@ func startServer(statePath string, proposalTTL, emptyTTL time.Duration) (string,
 	return server.Address(), func() { _ = server.Close() }
 }
 
-func shutdownServer(_, _ string, _, _ time.Duration, shutdown func()) error {
-	shutdown()
-	return nil
+func readResults(statePath string) map[string]string {
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var saved struct {
+		Results map[string]string `json:"results"`
+	}
+	if err := json.Unmarshal(data, &saved); err != nil {
+		log.Fatal(err)
+	}
+	return saved.Results
 }
 
 func dial(id, addr string) *client {
@@ -165,7 +198,11 @@ func (c *client) reconnect(addr string) {
 }
 
 func (c *client) send(value map[string]interface{}) {
-	value["session_id"] = c.session
+	c.sendRaw(c.session, value)
+}
+
+func (c *client) sendRaw(session string, value map[string]interface{}) {
+	value["session_id"] = session
 	value["player_id"] = c.id
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -231,6 +268,10 @@ func (c *client) confirm(roomID string) {
 	c.send(map[string]interface{}{"type": "confirm", "room_id": roomID})
 }
 
+func (c *client) confirmWithSession(session, roomID string) {
+	c.sendRaw(session, map[string]interface{}{"type": "confirm", "room_id": roomID})
+}
+
 func (c *client) confirmFragmented(roomID string) {
 	c.sendFragment(map[string]interface{}{"type": "confirm", "room_id": roomID}, 5)
 }
@@ -242,8 +283,9 @@ func (c *client) confirmMerged(roomID string) {
 	)
 }
 
-func (c *client) reject(roomID string) {
-	c.send(map[string]interface{}{"type": "reject", "room_id": roomID})
+func (c *client) snapshot() internal.Response {
+	c.send(map[string]interface{}{"type": "snapshot"})
+	return c.expect("snapshot")
 }
 
 func (c *client) expect(kinds ...string) internal.Response {
@@ -278,6 +320,80 @@ func (c *client) expect(kinds ...string) internal.Response {
 			log.Fatalf("%s waited for %v: %v", c.id, kinds, err)
 		}
 	}
+}
+
+func (c *client) expectStatus(kind, status string) internal.Response {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		resp := c.expect(kind)
+		if resp.Status == status {
+			return resp
+		}
+	}
+	log.Fatalf("%s never saw %s with status %s", c.id, kind, status)
+	return internal.Response{}
+}
+
+func (c *client) expectRoomState(status string, reserved []string, members ...string) internal.Response {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		resp := c.expect("room_state")
+		if resp.Status == status && sameStrings(resp.Reserved, reserved) && sameStrings(resp.Members, members) {
+			return resp
+		}
+	}
+	log.Fatalf("%s never saw room_state status=%s reserved=%v members=%v", c.id, status, reserved, members)
+	return internal.Response{}
+}
+
+func (c *client) expectNone(window time.Duration, allowed ...string) {
+	_ = c.conn.SetReadDeadline(time.Now().Add(window))
+	for {
+		line, err := c.reader.ReadBytes('\n')
+		if len(line) > 0 {
+			var resp internal.Response
+			if json.Unmarshal(line, &resp) != nil {
+				log.Fatalf("%s received bad JSON %q", c.id, line)
+			}
+			if !contains(allowed, resp.Type) {
+				log.Fatalf("%s unexpectedly received %#v", c.id, resp)
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				log.Fatalf("%s closed during quiet window", c.id)
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return
+			}
+			log.Fatalf("%s quiet window: %v", c.id, err)
+		}
+	}
+}
+
+func sameStrings(a, b []string) bool {
+	as := append([]string(nil), a...)
+	bs := append([]string(nil), b...)
+	sort.Strings(as)
+	sort.Strings(bs)
+	if len(as) != len(bs) {
+		return false
+	}
+	for i := range as {
+		if as[i] != bs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func contains(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *client) close() { _ = c.conn.Close() }

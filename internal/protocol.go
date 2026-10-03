@@ -18,6 +18,7 @@ type Response struct {
 	Mode       string   `json:"mode,omitempty"`
 	RoomSize   int      `json:"room_size,omitempty"`
 	Members    []string `json:"members,omitempty"`
+	Reserved   []string `json:"reserved,omitempty"`
 	Waiting    []string `json:"waiting,omitempty"`
 	Reason     string   `json:"reason,omitempty"`
 	Message    string   `json:"message,omitempty"`
