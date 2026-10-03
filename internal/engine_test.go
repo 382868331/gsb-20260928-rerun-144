@@ -16,6 +16,7 @@ func testEngine(t *testing.T) (*Engine, *time.Time) {
 	}
 	engine.proposalTTL = 10 * time.Second
 	engine.emptyTTL = 15 * time.Second
+	engine.reserveTTL = 2 * time.Second
 	return engine, &now
 }
 
@@ -49,6 +50,15 @@ func TestMatchConfirmDisconnectRefillAndRestart(t *testing.T) {
 	}
 	engine.Disconnect(sessions["p1"])
 	room := engine.rooms[roomID]
+	if room == nil || room.Members["p1"] == nil || !room.Members["p1"].Disconnected {
+		t.Fatalf("confirmed seat was not reserved on disconnect: %#v", room)
+	}
+	if room.Members["p3"] != nil {
+		t.Fatalf("reserved seat was handed out before expiry: %#v", room)
+	}
+	*now = now.Add(3 * time.Second)
+	engine.Tick()
+	room = engine.rooms[roomID]
 	if room == nil || room.Members["p3"] == nil || room.Members["p3"].Status != StatusInvited {
 		t.Fatalf("p3 was not offered released slot: %#v", room)
 	}
@@ -171,5 +181,101 @@ func TestIncompatibleEarlierPlayerDoesNotBlockLaterMatch(t *testing.T) {
 	resp := engine.Handle(queueReq("p3", 11, 2), s3)
 	if resp.Type != "invited" {
 		t.Fatalf("compatible later players not matched: %#v", resp)
+	}
+}
+
+func activeRoom(t *testing.T, engine *Engine, sessions map[string]string, players ...string) string {
+	t.Helper()
+	var roomID string
+	for i, player := range players {
+		resp := engine.Handle(queueReq(player, 10+i, 2), sessions[player])
+		if resp.RoomID != "" {
+			roomID = resp.RoomID
+		}
+	}
+	for _, player := range players {
+		engine.Handle(Request{Type: "confirm", PlayerID: player, RoomID: roomID}, sessions[player])
+	}
+	if room := engine.rooms[roomID]; room == nil || room.Status != StatusActive {
+		t.Fatalf("room not active: %#v", engine.rooms[roomID])
+	}
+	return roomID
+}
+
+func TestFinalConfirmConvergesAndDuplicateIsIdempotent(t *testing.T) {
+	engine, _ := testEngine(t)
+	s1, _ := engine.Hello("p1")
+	s2, _ := engine.Hello("p2")
+	engine.Handle(queueReq("p1", 10, 2), s1)
+	invited := engine.Handle(queueReq("p2", 11, 2), s2)
+	first := engine.Handle(Request{Type: "confirm", PlayerID: "p1", RoomID: invited.RoomID}, s1)
+	if first.Type != "room_state" || first.Status != StatusProposed {
+		t.Fatalf("non-final confirm = %#v", first)
+	}
+	final := engine.Handle(Request{Type: "confirm", PlayerID: "p2", RoomID: invited.RoomID}, s2)
+	if final.Type != "confirmed" || final.Status != StatusActive {
+		t.Fatalf("final confirm = %#v", final)
+	}
+	states := engine.PublicRoomStates()
+	if states["p1"].Type != "confirmed" || states["p1"].Status != StatusActive ||
+		states["p2"].Type != "confirmed" || states["p2"].Status != StatusActive {
+		t.Fatalf("participants see different decisions: %#v", states)
+	}
+	dup := engine.Handle(Request{Type: "confirm", PlayerID: "p1", RoomID: invited.RoomID}, s1)
+	if dup.Type != "confirmed" || dup.Status != StatusActive {
+		t.Fatalf("duplicate confirm regressed the room: %#v", dup)
+	}
+}
+
+func TestReservedSeatSurvivesReconnectAndIgnoresStaleDisconnect(t *testing.T) {
+	engine, now := testEngine(t)
+	sessions := map[string]string{}
+	for _, player := range []string{"p1", "p2"} {
+		session, _ := engine.Hello(player)
+		sessions[player] = session
+	}
+	roomID := activeRoom(t, engine, sessions, "p1", "p2")
+	engine.Disconnect(sessions["p1"])
+	resumedSession, resp := engine.Hello("p1")
+	if resp.Type != "resumed" || resp.RoomID != roomID || resp.Status != StatusActive {
+		t.Fatalf("resume response = %#v", resp)
+	}
+	engine.Disconnect(sessions["p1"])
+	room := engine.rooms[roomID]
+	if room.Members["p1"] == nil || room.Members["p1"].Disconnected {
+		t.Fatalf("stale disconnect touched the new identity: %#v", room.Members["p1"])
+	}
+	engine.Disconnect(resumedSession)
+	if room.Members["p1"] == nil || !room.Members["p1"].Disconnected {
+		t.Fatalf("current disconnect did not reserve the seat: %#v", room.Members["p1"])
+	}
+	*now = now.Add(3 * time.Second)
+	engine.Tick()
+	if engine.rooms[roomID].Members["p1"] != nil {
+		t.Fatalf("reserved seat did not expire: %#v", engine.rooms[roomID].Members)
+	}
+	if engine.Result("p1") != StatusCanceled {
+		t.Fatalf("expired seat result = %q", engine.Result("p1"))
+	}
+}
+
+func TestCanceledRoomIsNotRefilled(t *testing.T) {
+	engine, _ := testEngine(t)
+	s1, _ := engine.Hello("p1")
+	s2, _ := engine.Hello("p2")
+	s3, _ := engine.Hello("p3")
+	engine.Handle(queueReq("p1", 10, 2), s1)
+	engine.Handle(queueReq("p2", 11, 2), s2)
+	engine.Handle(queueReq("p3", 20, 2), s3)
+	engine.Shutdown()
+	s4, _ := engine.Hello("p4")
+	if resp := engine.Handle(queueReq("p4", 10, 2), s4); resp.Type != "queued" {
+		t.Fatalf("new player was placed into a canceled room: %#v", resp)
+	}
+	engine.Tick()
+	for id, room := range engine.rooms {
+		if room.Status == StatusCanceled && room.Members["p4"] != nil {
+			t.Fatalf("canceled room %s reopened by fill: %#v", id, room.Members)
+		}
 	}
 }

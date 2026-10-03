@@ -86,6 +86,7 @@ func (s *Server) loop() {
 				sessionID, resp := s.engine.Hello(event.PlayerID)
 				s.attachConn(sessionID, event.Conn.(net.Conn))
 				event.Resp <- resp
+				s.broadcastRoomStates()
 			case "request":
 				resp := s.engine.Handle(event.Request, event.SessionID)
 				s.sendToSession(event.SessionID, resp)

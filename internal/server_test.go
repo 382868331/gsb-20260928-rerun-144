@@ -27,15 +27,16 @@ type tcpClient struct {
 	conn    net.Conn
 	reader  *bufio.Reader
 	session string
+	last    Response
 }
 
-func startTestServer(t *testing.T, proposalTTL, emptyTTL time.Duration) (*Server, *Engine) {
+func startTestServer(t *testing.T, proposalTTL, emptyTTL, reserveTTL time.Duration) (*Server, *Engine) {
 	t.Helper()
 	engine, err := NewEngine(NewStore(filepath.Join(t.TempDir(), "state.json")), time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine.SetTimeouts(proposalTTL, emptyTTL)
+	engine.SetTimeouts(proposalTTL, emptyTTL, reserveTTL)
 	server, err := NewServer(engine, "127.0.0.1:0")
 	skipWithoutListen(t, err)
 	t.Cleanup(func() { _ = server.Close() })
@@ -58,6 +59,7 @@ func (c *tcpClient) hello() {
 	c.writeLine(marshalLine(c.t, map[string]interface{}{"type": "hello", "player_id": c.id}))
 	resp := c.readUntil("hello", "resumed")
 	c.session = resp.SessionID
+	c.last = resp
 }
 
 func marshalLine(t *testing.T, value map[string]interface{}) []byte {
@@ -71,6 +73,12 @@ func marshalLine(t *testing.T, value map[string]interface{}) []byte {
 
 func (c *tcpClient) request(value map[string]interface{}) {
 	value["session_id"] = c.session
+	value["player_id"] = c.id
+	c.writeLine(marshalLine(c.t, value))
+}
+
+func (c *tcpClient) requestAs(session string, value map[string]interface{}) {
+	value["session_id"] = session
 	value["player_id"] = c.id
 	c.writeLine(marshalLine(c.t, value))
 }
@@ -133,7 +141,7 @@ func (c *tcpClient) readUntil(kinds ...string) Response {
 func (c *tcpClient) close() { _ = c.conn.Close() }
 
 func TestTCPFragmentedAndMergedMessagesConfirmExitRefill(t *testing.T) {
-	server, engine := startTestServer(t, time.Second, 2*time.Second)
+	server, engine := startTestServer(t, time.Second, 2*time.Second, 300*time.Millisecond)
 	p1 := dialTCP(t, server.Address(), "p1")
 	p2 := dialTCP(t, server.Address(), "p2")
 	p3 := dialTCP(t, server.Address(), "p3")
@@ -149,9 +157,12 @@ func TestTCPFragmentedAndMergedMessagesConfirmExitRefill(t *testing.T) {
 		map[string]interface{}{"type": "confirm", "room_id": first.RoomID},
 		map[string]interface{}{"type": "snapshot"},
 	)
+	if resp := p1.readUntil("room_state"); resp.Status != StatusProposed {
+		t.Fatalf("p1 non-final confirm = %#v", resp)
+	}
 	p2.requestFragments(map[string]interface{}{"type": "confirm", "room_id": second.RoomID}, 7)
 	if resp := p1.readUntil("confirmed"); resp.Status != StatusActive {
-		t.Fatalf("p1 final confirm = %#v", resp)
+		t.Fatalf("p1 final decision broadcast = %#v", resp)
 	}
 	if resp := p2.readUntil("confirmed"); resp.Status != StatusActive {
 		t.Fatalf("p2 final confirm = %#v", resp)
@@ -160,7 +171,14 @@ func TestTCPFragmentedAndMergedMessagesConfirmExitRefill(t *testing.T) {
 	p3.request(map[string]interface{}{"type": "queue", "mode": "ranked", "level": 12, "room_size": 2})
 	p3.readUntil("queued")
 	p2.close()
-	p1.readUntil("room_state")
+	time.Sleep(120 * time.Millisecond)
+	room := engine.rooms[first.RoomID]
+	if room == nil || room.Members["p2"] == nil || !room.Members["p2"].Disconnected {
+		t.Fatalf("p2 seat was not reserved: %#v", room)
+	}
+	if room.Members["p3"] != nil {
+		t.Fatalf("reserved seat was refilled before expiry: %#v", room)
+	}
 	refill := p3.readUntil("invited")
 	if refill.RoomID != first.RoomID || refill.Reason != StatusInvited {
 		t.Fatalf("p3 refill invitation = %#v", refill)
@@ -179,7 +197,7 @@ func TestTCPFragmentedAndMergedMessagesConfirmExitRefill(t *testing.T) {
 }
 
 func TestTCPCancelledWaitersAreWokenOnClose(t *testing.T) {
-	server, engine := startTestServer(t, time.Second, 2*time.Second)
+	server, engine := startTestServer(t, time.Second, 2*time.Second, 300*time.Millisecond)
 	p1 := dialTCP(t, server.Address(), "p1")
 	p2 := dialTCP(t, server.Address(), "p2")
 	p1.request(map[string]interface{}{"type": "queue", "mode": "ranked", "level": 1, "room_size": 2})
@@ -208,7 +226,7 @@ func TestTCPCancelledWaitersAreWokenOnClose(t *testing.T) {
 }
 
 func TestTCPOldInvitationCannotConfirmNewRoom(t *testing.T) {
-	server, _ := startTestServer(t, 60*time.Millisecond, time.Second)
+	server, _ := startTestServer(t, 60*time.Millisecond, time.Second, 300*time.Millisecond)
 	p1 := dialTCP(t, server.Address(), "p1")
 	p2 := dialTCP(t, server.Address(), "p2")
 	p1.request(map[string]interface{}{"type": "queue", "mode": "ranked", "level": 10, "room_size": 2})
@@ -236,7 +254,45 @@ func TestTCPOldInvitationCannotConfirmNewRoom(t *testing.T) {
 		t.Fatalf("old invite result = %#v", resp)
 	}
 	p3.request(map[string]interface{}{"type": "confirm", "room_id": newRoom.RoomID})
-	if resp := p3.readUntil("confirmed"); resp.Status != StatusProposed {
+	if resp := p3.readUntil("room_state"); resp.Status != StatusProposed {
 		t.Fatalf("new room accepted old confirmation: %#v", resp)
+	}
+}
+
+func TestTCPReconnectKeepsReservedSeatAndRejectsStaleSession(t *testing.T) {
+	server, engine := startTestServer(t, time.Second, 2*time.Second, time.Second)
+	p1 := dialTCP(t, server.Address(), "p1")
+	p2 := dialTCP(t, server.Address(), "p2")
+	p3 := dialTCP(t, server.Address(), "p3")
+	p1.request(map[string]interface{}{"type": "queue", "mode": "ranked", "level": 10, "room_size": 2})
+	p2.request(map[string]interface{}{"type": "queue", "mode": "ranked", "level": 11, "room_size": 2})
+	invited := p1.readUntil("invited")
+	p2.readUntil("invited")
+	p1.request(map[string]interface{}{"type": "confirm", "room_id": invited.RoomID})
+	p2.request(map[string]interface{}{"type": "confirm", "room_id": invited.RoomID})
+	p1.readUntil("confirmed")
+	p2.readUntil("confirmed")
+
+	p3.request(map[string]interface{}{"type": "queue", "mode": "ranked", "level": 12, "room_size": 2})
+	p3.readUntil("queued")
+
+	oldSession := p2.session
+	p2.close()
+	p2 = dialTCP(t, server.Address(), "p2")
+	resumed := p2.last
+	if resumed.RoomID != invited.RoomID || resumed.Status != StatusActive {
+		t.Fatalf("p2 did not resume its reserved seat: %#v", resumed)
+	}
+	p2.requestAs(oldSession, map[string]interface{}{"type": "confirm", "room_id": invited.RoomID})
+	if resp := p2.readUntil("error"); resp.Reason != "stale_session" {
+		t.Fatalf("stale session confirm = %#v", resp)
+	}
+	time.Sleep(150 * time.Millisecond)
+	room := engine.rooms[invited.RoomID]
+	if room == nil || room.Members["p2"] == nil || room.Members["p2"].Disconnected || room.Members["p3"] != nil {
+		t.Fatalf("reserved seat changed hands during grace period: %#v", room)
+	}
+	if engine.Result("p2") != StatusActive || engine.Result("p1") != StatusActive {
+		t.Fatalf("results after resume = p1:%q p2:%q", engine.Result("p1"), engine.Result("p2"))
 	}
 }

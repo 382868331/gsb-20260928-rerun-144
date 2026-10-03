@@ -8,7 +8,10 @@ Go 实现的本地多人房间组织服务。服务使用 TCP + 换行分隔 JSO
 - 等待队列按 FIFO 选择；同模式、同目标人数、等级差不超过 2 才可组队。
 - 支持 2-4 人房间，首轮邀请需要全员确认。
 - 玩家已在房间或队列中时不能重复占位。
-- 掉线、拒绝或取消会释放名额；有合格等待者时立即补位并推送新邀请。
+- 最后一次确认让房间进入 active，所有成员都会收到同一个 confirmed 最终决定；重复确认幂等返回当前状态，不会让房间退回提议阶段。
+- 已确认成员短暂掉线时席位保留 5 秒，保留期内不补位；重新握手即可回到原席位，旧连接的迟到退出或确认不会作用到新会话。
+- 保留到期仍未归来的席位才会释放并立即补位；未确认成员的掉线、拒绝或取消会立刻释放名额。
+- 已取消或已完成的房间不会被补位流程重新打开。
 - 10 秒未确认会释放对应成员并重新排队；活跃房间缺员且 15 秒无法补齐时回收房间并重新排队。
 - 关键状态通过临时文件加原子重命名保存为 JSON；重启后校验重复占位，并恢复活跃房间。
 
@@ -25,7 +28,7 @@ go run ./cmd/server -addr 127.0.0.1:7700 -state ./state.json
 go run ./cmd/demo -state /tmp/multiplayer-session-demo.json
 ```
 
-演练会建立真实 TCP 客户端，并主动制造请求字节分片和两条请求合并到达，完成匹配、全员确认、中途退出补位、保存后重启恢复、旧邀请与旧会话拒绝，以及关闭时等待者收到取消结果。每个客户端连接持续复用同一个带缓冲的换行帧读取器，避免合并到达的下一条报文被丢弃。
+演练会建立真实 TCP 客户端，并主动制造请求字节分片和两条请求合并到达，依次核对：最后确认后全员收敛到同一个 active 决定、重复确认幂等、短暂断线保留席位并重连恢复、旧会话确认被拒绝、保留到期后等待者补位、迟到确认不再影响房间、重启后通过 result 查询仍能解释最终决定、旧邀请无法确认重匹配房间，以及关闭时等待者收到取消结果。每个客户端连接持续复用同一个带缓冲的换行帧读取器，避免合并到达的下一条报文被丢弃。
 
 `internal/server_test.go` 中的 TCP 回归测试会在允许本地监听的环境强制执行；如果容器内核返回 `socket: operation not permitted`，这些测试会跳过，纯引擎和持久化回归仍会正常执行。
 
@@ -45,6 +48,7 @@ go run ./cmd/demo -state /tmp/multiplayer-session-demo.json
 {"type":"reject","session_id":"...","player_id":"p1","room_id":"room-1"}
 {"type":"cancel","session_id":"...","player_id":"p1"}
 {"type":"snapshot","session_id":"...","player_id":"p1"}
+{"type":"result","session_id":"...","player_id":"p1"}
 ```
 
-响应类型包括 `queued`、`invited`、`confirmed`、`room_state`、`resumed`、`canceled`、`rejected` 和 `error`。`room_state` 在房间成员或等待状态变化时推送给当前有效会话。
+响应类型包括 `queued`、`invited`、`confirmed`、`room_state`、`resumed`、`canceled`、`rejected`、`result` 和 `error`。未完成的确认返回 `room_state`；房间达到 active 时，所有成员都会收到携带相同成员名单的 `confirmed`。`room_state` 在房间成员或等待状态变化时推送给当前有效会话，保留中的席位以 `reserved` 原因标注。

@@ -16,8 +16,10 @@ const (
 )
 
 type Member struct {
-	PlayerID string
-	Status   string
+	PlayerID                string
+	Status                  string
+	Disconnected            bool
+	DisconnectedSinceUnixMS int64
 }
 
 type Room struct {
@@ -60,6 +62,7 @@ type Engine struct {
 	store        *Store
 	proposalTTL  time.Duration
 	emptyTTL     time.Duration
+	reserveTTL   time.Duration
 	queue        []QueueRecord
 	rooms        map[string]*Room
 	sessions     map[string]string
@@ -80,7 +83,7 @@ func NewEngine(store *Store, now func() time.Time) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	e := &Engine{store: store, proposalTTL: 10 * time.Second, emptyTTL: 15 * time.Second,
+	e := &Engine{store: store, proposalTTL: 10 * time.Second, emptyTTL: 15 * time.Second, reserveTTL: 5 * time.Second,
 		queue: queue, rooms: rooms, sessions: map[string]string{}, players: map[string]string{}, results: results,
 		nextSeq: nextSeq, nextRoom: nextRoom, now: now}
 	e.fillVacancies()
@@ -142,34 +145,55 @@ func (e *Engine) Hello(player string) (string, Response) {
 	e.sessions[sessionID] = player
 	e.players[player] = sessionID
 	resp := Response{Type: "hello", OK: true, SessionID: sessionID}
-	if room := e.roomOf(player); room != nil {
+	if result := e.results[player]; result != "" {
+		resp.Status = result
+	}
+	if room := e.roomOf(player); room != nil && room.Status != StatusCanceled {
+		if member := room.Members[player]; member != nil && member.Disconnected {
+			member.Disconnected = false
+			member.DisconnectedSinceUnixMS = 0
+		}
 		resp.Type = "resumed"
 		resp.RoomID = room.ID
 		resp.Mode = room.Mode
 		resp.RoomSize = room.Size
+		resp.Status = room.Status
 		resp.Members = room.confirmedIDs()
 	}
+	_ = e.save()
 	return sessionID, resp
 }
 
 func (e *Engine) CurrentSession(player string) string { return e.players[player] }
 func (e *Engine) Result(player string) string         { return e.results[player] }
 
-func (e *Engine) SetTimeouts(proposal, empty time.Duration) {
+func (e *Engine) SetTimeouts(proposal, empty, reserve time.Duration) {
 	e.proposalTTL = proposal
 	e.emptyTTL = empty
+	e.reserveTTL = reserve
 }
 
 func (e *Engine) PublicRoomStates() map[string]Response {
 	states := map[string]Response{}
 	for _, room := range e.rooms {
+		if room.Status == StatusCanceled {
+			continue
+		}
 		for playerID, member := range room.Members {
-			responseType := "room_state"
-			if member.Status == StatusInvited {
-				responseType = "invited"
+			resp := Response{OK: true, RoomID: room.ID, Mode: room.Mode, RoomSize: room.Size,
+				Members: room.confirmedIDs(), Status: room.Status, Reason: member.Status, DeadlineMS: room.DeadlineUnixMS}
+			switch {
+			case member.Status == StatusInvited:
+				resp.Type = "invited"
+			case room.Status == StatusActive:
+				resp.Type = "confirmed"
+			default:
+				resp.Type = "room_state"
 			}
-			states[playerID] = Response{Type: responseType, OK: true, RoomID: room.ID, Mode: room.Mode,
-				RoomSize: room.Size, Members: room.confirmedIDs(), Reason: member.Status, DeadlineMS: room.DeadlineUnixMS}
+			if member.Disconnected {
+				resp.Reason = "reserved"
+			}
+			states[playerID] = resp
 		}
 	}
 	for _, item := range e.queue {
@@ -184,19 +208,24 @@ func (e *Engine) Disconnect(sessionID string) {
 		return
 	}
 	delete(e.sessions, sessionID)
-	if e.players[player] == sessionID {
-		delete(e.players, player)
+	if e.players[player] != sessionID {
+		return
 	}
+	delete(e.players, player)
 	e.removeQueue(player)
-	if room := e.roomOf(player); room != nil {
-		if member := room.Members[player]; member == nil || member.Status != StatusConfirmed {
+	if room := e.roomOf(player); room != nil && room.Status != StatusCanceled {
+		member := room.Members[player]
+		if member != nil && member.Status == StatusConfirmed {
+			member.Disconnected = true
+			member.DisconnectedSinceUnixMS = e.now().UnixMilli()
+		} else {
 			e.setResult(player, StatusCanceled)
+			delete(room.Members, player)
+			if room.Status == StatusActive && len(room.Members) < room.Size && room.EmptySinceUnixMS == 0 {
+				room.EmptySinceUnixMS = e.now().UnixMilli()
+			}
+			e.fillVacancies()
 		}
-		delete(room.Members, player)
-		if room.Status == StatusActive && len(room.Members) < room.Size && room.EmptySinceUnixMS == 0 {
-			room.EmptySinceUnixMS = e.now().UnixMilli()
-		}
-		e.fillVacancies()
 	}
 	e.deleteEmptyRooms()
 	_ = e.save()
@@ -214,6 +243,11 @@ func (e *Engine) Handle(req Request, sessionID string) Response {
 		return e.reject(req, sessionID)
 	case "snapshot":
 		return e.snapshot()
+	case "result":
+		if !e.validSession(sessionID, req.PlayerID) {
+			return Response{Type: "error", Reason: "stale_session"}
+		}
+		return Response{Type: "result", OK: true, Status: e.results[req.PlayerID]}
 	default:
 		return Response{Type: "error", Reason: "unknown_command"}
 	}
@@ -255,11 +289,14 @@ func (e *Engine) cancel(req Request, sessionID string) Response {
 	if !e.validSession(sessionID, req.PlayerID) {
 		return Response{Type: "error", Reason: "stale_session"}
 	}
-	if room := e.roomOf(req.PlayerID); room != nil {
+	if room := e.roomOf(req.PlayerID); room != nil && room.Status != StatusCanceled {
 		if member := room.Members[req.PlayerID]; member == nil || member.Status != StatusConfirmed {
 			e.setResult(req.PlayerID, StatusCanceled)
 		}
 		delete(room.Members, req.PlayerID)
+		if room.Status == StatusActive && len(room.Members) < room.Size && room.EmptySinceUnixMS == 0 {
+			room.EmptySinceUnixMS = e.now().UnixMilli()
+		}
 		e.fillVacancies()
 		e.deleteEmptyRooms()
 		_ = e.save()
@@ -278,15 +315,16 @@ func (e *Engine) confirm(req Request, sessionID string) Response {
 		return Response{Type: "error", Reason: "stale_session"}
 	}
 	room := e.roomOf(req.PlayerID)
-	if room == nil || room.ID != req.RoomID {
+	if room == nil || room.ID != req.RoomID || room.Status == StatusCanceled {
 		return Response{Type: "error", Reason: "not_invited"}
 	}
-	if member := room.Members[req.PlayerID]; member != nil && member.Status == StatusConfirmed {
-		return Response{Type: "error", Reason: "already_confirmed"}
-	}
 	member := room.Members[req.PlayerID]
-	member.Status = StatusConfirmed
-	if room.allConfirmed() {
+	if member.Status != StatusConfirmed {
+		member.Status = StatusConfirmed
+	}
+	member.Disconnected = false
+	member.DisconnectedSinceUnixMS = 0
+	if room.Status == StatusProposed && room.allConfirmed() {
 		room.Status = StatusActive
 		room.DeadlineUnixMS = 0
 		room.EmptySinceUnixMS = 0
@@ -295,7 +333,7 @@ func (e *Engine) confirm(req Request, sessionID string) Response {
 		}
 	}
 	_ = e.save()
-	return Response{Type: "confirmed", OK: true, RoomID: room.ID, Status: room.Status, Members: room.confirmedIDs()}
+	return confirmResponse(room)
 }
 
 func (e *Engine) reject(req Request, sessionID string) Response {
@@ -303,7 +341,7 @@ func (e *Engine) reject(req Request, sessionID string) Response {
 		return Response{Type: "error", Reason: "stale_session"}
 	}
 	room := e.roomOf(req.PlayerID)
-	if room == nil || room.ID != req.RoomID {
+	if room == nil || room.ID != req.RoomID || room.Status == StatusCanceled {
 		return Response{Type: "error", Reason: "not_invited"}
 	}
 	if member := room.Members[req.PlayerID]; member != nil && member.Status == StatusConfirmed {
@@ -396,6 +434,12 @@ func (e *Engine) fillVacancies() {
 		return rooms[i].ID < rooms[j].ID
 	})
 	for _, room := range rooms {
+		if room.Status != StatusProposed && room.Status != StatusActive {
+			continue
+		}
+		if room.Status == StatusActive && len(room.confirmedIDs()) == 0 {
+			continue
+		}
 		for len(room.Members) < room.Size {
 			index := -1
 			for i, item := range e.queue {
@@ -433,6 +477,27 @@ func (e *Engine) Tick() []Response {
 	nowMS := e.now().UnixMilli()
 	changed := false
 	for id, room := range e.rooms {
+		if room.Status == StatusProposed || room.Status == StatusActive {
+			expired := false
+			for playerID, member := range room.Members {
+				if member.Disconnected && nowMS-member.DisconnectedSinceUnixMS >= e.reserveTTL.Milliseconds() {
+					delete(room.Members, playerID)
+					e.setResult(playerID, StatusCanceled)
+					expired = true
+				}
+			}
+			if expired {
+				changed = true
+				if len(room.Members) == 0 {
+					delete(e.rooms, id)
+					continue
+				}
+				if room.Status == StatusActive && len(room.Members) < room.Size && room.EmptySinceUnixMS == 0 {
+					room.EmptySinceUnixMS = nowMS
+				}
+				e.fillVacancies()
+			}
+		}
 		switch room.Status {
 		case StatusProposed:
 			if room.DeadlineUnixMS > 0 && nowMS >= room.DeadlineUnixMS {
@@ -445,8 +510,10 @@ func (e *Engine) Tick() []Response {
 				for playerID, member := range room.Members {
 					if member.Status == StatusConfirmed || member.Status == StatusInvited {
 						e.setResult(playerID, StatusCanceled)
-						e.queue = append(e.queue, QueueRecord{Seq: e.nextSeq, PlayerID: playerID, Mode: room.Mode, Level: room.Level, RoomSize: room.Size})
-						e.nextSeq++
+						if !member.Disconnected {
+							e.queue = append(e.queue, QueueRecord{Seq: e.nextSeq, PlayerID: playerID, Mode: room.Mode, Level: room.Level, RoomSize: room.Size})
+							e.nextSeq++
+						}
 					}
 				}
 				delete(e.rooms, id)
@@ -474,7 +541,10 @@ func (e *Engine) Tick() []Response {
 				}
 				if nowMS-room.EmptySinceUnixMS >= e.emptyTTL.Milliseconds() {
 					for playerID, member := range room.Members {
-						if member.Status == StatusConfirmed {
+						if member.Disconnected {
+							continue
+						}
+						if member.Status == StatusConfirmed || member.Status == StatusInvited {
 							e.queue = append(e.queue, QueueRecord{Seq: e.nextSeq, PlayerID: playerID, Mode: room.Mode, Level: room.Level, RoomSize: room.Size})
 							e.nextSeq++
 						}
@@ -492,6 +562,18 @@ func (e *Engine) Tick() []Response {
 		_ = e.save()
 	}
 	return nil
+}
+
+func confirmResponse(room *Room) Response {
+	resp := Response{OK: true, RoomID: room.ID, Status: room.Status, Members: room.confirmedIDs()}
+	if room.Status == StatusActive {
+		resp.Type = "confirmed"
+	} else {
+		resp.Type = "room_state"
+		resp.Reason = StatusConfirmed
+		resp.DeadlineMS = room.DeadlineUnixMS
+	}
+	return resp
 }
 
 func (e *Engine) inviteResponse(room *Room) Response {
