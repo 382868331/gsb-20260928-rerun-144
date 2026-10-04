@@ -13,11 +13,15 @@ const (
 	StatusProposed  = "proposed"
 	StatusActive    = "active"
 	StatusCanceled  = "canceled"
+	StatusReserved  = "reserved"
+	StatusVacant    = "vacant"
 )
 
 type Member struct {
 	PlayerID                string
 	Status                  string
+	Seat                    int
+	JoinSeq                 int64
 	Disconnected            bool
 	DisconnectedSinceUnixMS int64
 }
@@ -47,6 +51,21 @@ func (r *Room) confirmedIDs() []string {
 
 func (r *Room) allConfirmed() bool {
 	return len(r.Members) == r.Size && len(r.Members) == len(r.confirmedIDs())
+}
+
+func (r *Room) nextSeat() int {
+	taken := make([]bool, r.Size)
+	for _, member := range r.Members {
+		if member.Seat >= 0 && member.Seat < r.Size {
+			taken[member.Seat] = true
+		}
+	}
+	for seat, occupied := range taken {
+		if !occupied {
+			return seat
+		}
+	}
+	return len(r.Members)
 }
 
 type ClientEvent struct {
@@ -91,6 +110,19 @@ func NewEngine(store *Store, now func() time.Time) (*Engine, error) {
 }
 
 func (e *Engine) save() error {
+	for _, room := range e.rooms {
+		if room.Status == StatusActive {
+			pending := false
+			for _, member := range room.Members {
+				if member.Status == StatusInvited {
+					pending = true
+				}
+			}
+			if !pending {
+				room.DeadlineUnixMS = 0
+			}
+		}
+	}
 	return e.store.Save(e.nextSeq, e.nextRoom, e.queue, e.rooms, e.results)
 }
 
@@ -159,6 +191,10 @@ func (e *Engine) Hello(player string) (string, Response) {
 		resp.RoomSize = room.Size
 		resp.Status = room.Status
 		resp.Members = room.confirmedIDs()
+		resp.Seats = e.roomSeats(room)
+		if member := room.Members[player]; member != nil && member.Status == StatusInvited {
+			resp.DeadlineMS = room.DeadlineUnixMS
+		}
 	}
 	_ = e.save()
 	return sessionID, resp
@@ -173,6 +209,32 @@ func (e *Engine) SetTimeouts(proposal, empty, reserve time.Duration) {
 	e.reserveTTL = reserve
 }
 
+func (e *Engine) roomSeats(room *Room) []SeatState {
+	seats := make([]SeatState, 0, room.Size)
+	bySeat := map[int]*Member{}
+	for _, member := range room.Members {
+		bySeat[member.Seat] = member
+	}
+	for seat := 0; seat < room.Size; seat++ {
+		member := bySeat[seat]
+		if member == nil {
+			seats = append(seats, SeatState{Seat: seat, Status: StatusVacant})
+			continue
+		}
+		online := e.players[member.PlayerID] != ""
+		status := member.Status
+		deadline := int64(0)
+		if member.Disconnected {
+			status = StatusReserved
+			deadline = member.DisconnectedSinceUnixMS + e.reserveTTL.Milliseconds()
+		} else if member.Status == StatusInvited {
+			deadline = room.DeadlineUnixMS
+		}
+		seats = append(seats, SeatState{Seat: seat, PlayerID: member.PlayerID, Status: status, Online: online, DeadlineMS: deadline})
+	}
+	return seats
+}
+
 func (e *Engine) PublicRoomStates() map[string]Response {
 	states := map[string]Response{}
 	for _, room := range e.rooms {
@@ -181,17 +243,22 @@ func (e *Engine) PublicRoomStates() map[string]Response {
 		}
 		for playerID, member := range room.Members {
 			resp := Response{OK: true, RoomID: room.ID, Mode: room.Mode, RoomSize: room.Size,
-				Members: room.confirmedIDs(), Status: room.Status, Reason: member.Status, DeadlineMS: room.DeadlineUnixMS}
+				Members: room.confirmedIDs(), Seats: e.roomSeats(room), Status: room.Status, Waiting: e.waitingIDs()}
 			switch {
+			case member.Disconnected:
+				resp.Type = "room_state"
+				resp.Reason = StatusReserved
+				resp.DeadlineMS = member.DisconnectedSinceUnixMS + e.reserveTTL.Milliseconds()
 			case member.Status == StatusInvited:
 				resp.Type = "invited"
+				resp.Reason = StatusInvited
+				resp.DeadlineMS = room.DeadlineUnixMS
 			case room.Status == StatusActive:
 				resp.Type = "confirmed"
+				resp.Reason = StatusConfirmed
 			default:
 				resp.Type = "room_state"
-			}
-			if member.Disconnected {
-				resp.Reason = "reserved"
+				resp.Reason = member.Status
 			}
 			states[playerID] = resp
 		}
@@ -332,8 +399,12 @@ func (e *Engine) confirm(req Request, sessionID string) Response {
 			e.setResult(playerID, StatusActive)
 		}
 	}
+	if room.Status == StatusActive && room.allConfirmed() {
+		room.DeadlineUnixMS = 0
+		room.EmptySinceUnixMS = 0
+	}
 	_ = e.save()
-	return confirmResponse(room)
+	return e.confirmResponse(room)
 }
 
 func (e *Engine) reject(req Request, sessionID string) Response {
@@ -408,7 +479,7 @@ func (e *Engine) match() {
 		chosen := map[string]bool{}
 		for _, item := range selected {
 			chosen[item.PlayerID] = true
-			room.Members[item.PlayerID] = &Member{PlayerID: item.PlayerID, Status: StatusInvited}
+			room.Members[item.PlayerID] = &Member{PlayerID: item.PlayerID, Status: StatusInvited, Seat: room.nextSeat(), JoinSeq: item.Seq}
 		}
 		e.rooms[id] = room
 		remaining := e.queue[:0]
@@ -453,7 +524,7 @@ func (e *Engine) fillVacancies() {
 			}
 			item := e.queue[index]
 			e.queue = append(e.queue[:index], e.queue[index+1:]...)
-			room.Members[item.PlayerID] = &Member{PlayerID: item.PlayerID, Status: StatusInvited}
+			room.Members[item.PlayerID] = &Member{PlayerID: item.PlayerID, Status: StatusInvited, Seat: room.nextSeat(), JoinSeq: item.Seq}
 			room.DeadlineUnixMS = e.now().Add(e.proposalTTL).UnixMilli()
 			if room.Status == StatusActive && room.EmptySinceUnixMS == 0 {
 				room.EmptySinceUnixMS = e.now().UnixMilli()
@@ -528,10 +599,10 @@ func (e *Engine) Tick() []Response {
 						delete(room.Members, playerID)
 					}
 				}
-				if room.allConfirmed() {
-					room.DeadlineUnixMS = 0
-					room.EmptySinceUnixMS = 0
+				if len(room.Members) < room.Size && room.EmptySinceUnixMS == 0 {
+					room.EmptySinceUnixMS = nowMS
 				}
+				e.fillVacancies()
 				changed = true
 			}
 			e.fillVacancies()
@@ -564,8 +635,8 @@ func (e *Engine) Tick() []Response {
 	return nil
 }
 
-func confirmResponse(room *Room) Response {
-	resp := Response{OK: true, RoomID: room.ID, Status: room.Status, Members: room.confirmedIDs()}
+func (e *Engine) confirmResponse(room *Room) Response {
+	resp := Response{OK: true, RoomID: room.ID, Status: room.Status, Members: room.confirmedIDs(), Seats: e.roomSeats(room), Waiting: e.waitingIDs()}
 	if room.Status == StatusActive {
 		resp.Type = "confirmed"
 	} else {
@@ -578,7 +649,7 @@ func confirmResponse(room *Room) Response {
 
 func (e *Engine) inviteResponse(room *Room) Response {
 	return Response{Type: "invited", OK: true, RoomID: room.ID, Mode: room.Mode, RoomSize: room.Size,
-		DeadlineMS: room.DeadlineUnixMS, Members: room.confirmedIDs()}
+		DeadlineMS: room.DeadlineUnixMS, Members: room.confirmedIDs(), Seats: e.roomSeats(room), Waiting: e.waitingIDs(), Reason: StatusInvited}
 }
 
 func (e *Engine) waitingIDs() []string {

@@ -70,6 +70,14 @@ func main() {
 	oldSession := p2.session
 	_ = p2.conn.Close()
 	time.Sleep(120 * time.Millisecond)
+	p1State := p1.expect("room_state")
+	p2Seat := findSeat(p1State, "p2")
+	if p2Seat.Status != internal.StatusReserved || p2Seat.Online || p2Seat.DeadlineMS == 0 {
+		log.Fatalf("p1 could not explain the reserved seat: %#v", p1State.Seats)
+	}
+	if vacant := findVacantSeat(p1State); vacant.Status != "missing" {
+		log.Fatalf("reserved seat was advertised as refillable: %#v", p1State.Seats)
+	}
 	p3.snapshot()
 	if snap := p3.expect("snapshot"); !contains(snap.Waiting, "p3") {
 		log.Fatalf("reserved seat was refilled during grace period: %#v", snap)
@@ -82,6 +90,10 @@ func main() {
 	if resp := p2.expect("error"); resp.Reason != "stale_session" {
 		log.Fatalf("stale connection confirm reached the new identity: %#v", resp)
 	}
+	p2Online := p1.expect("room_state")
+	if seat := findSeat(p2Online, "p2"); seat.Status != internal.StatusConfirmed || !seat.Online {
+		log.Fatalf("reconnected seat was not explained as online confirmed: %#v", p2Online.Seats)
+	}
 
 	log.Println("phase 3: reservation expires and a waiting player backfills")
 	_ = p2.conn.Close()
@@ -89,6 +101,11 @@ func main() {
 	refill := p3.expect("invited")
 	if refill.RoomID != first.RoomID {
 		log.Fatalf("p3 was offered %s instead of %s", refill.RoomID, first.RoomID)
+	}
+	p1Invite := p1.expect("room_state")
+	p3Seat := findSeat(p1Invite, "p3")
+	if p3Seat.Status != internal.StatusInvited || p3Seat.DeadlineMS != refill.DeadlineMS {
+		log.Fatalf("p1 could not explain the pending backfill seat: %#v", p1Invite.Seats)
 	}
 	p3.confirmFragmented(refill.RoomID)
 	if resp := p3.expect("confirmed"); resp.Status != internal.StatusActive {
@@ -206,6 +223,24 @@ func contains(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func findSeat(resp internal.Response, player string) internal.SeatState {
+	for _, seat := range resp.Seats {
+		if seat.PlayerID == player {
+			return seat
+		}
+	}
+	return internal.SeatState{Status: "missing"}
+}
+
+func findVacantSeat(resp internal.Response) internal.SeatState {
+	for _, seat := range resp.Seats {
+		if seat.Status == internal.StatusVacant {
+			return seat
+		}
+	}
+	return internal.SeatState{Status: "missing"}
 }
 
 func dial(id, addr string) *client {

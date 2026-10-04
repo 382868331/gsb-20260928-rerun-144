@@ -1,7 +1,9 @@
 package internal
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -277,5 +279,153 @@ func TestCanceledRoomIsNotRefilled(t *testing.T) {
 		if room.Status == StatusCanceled && room.Members["p4"] != nil {
 			t.Fatalf("canceled room %s reopened by fill: %#v", id, room.Members)
 		}
+	}
+}
+
+func findSeat(resp Response, player string) SeatState {
+	for _, seat := range resp.Seats {
+		if seat.PlayerID == player {
+			return seat
+		}
+	}
+	return SeatState{Status: "missing"}
+}
+
+func TestSeatStatesShowOnlineReservedVacantAndConfirmed(t *testing.T) {
+	engine, now := testEngine(t)
+	sessions := map[string]string{}
+	for _, player := range []string{"p1", "p2", "p3"} {
+		session, _ := engine.Hello(player)
+		sessions[player] = session
+	}
+	roomID := activeRoom(t, engine, sessions, "p1", "p2")
+	engine.Handle(queueReq("p3", 12, 2), sessions["p3"])
+
+	engine.Disconnect(sessions["p1"])
+	states := engine.PublicRoomStates()
+	p1Seat := findSeat(states["p1"], "p1")
+	if p1Seat.Status != StatusReserved || p1Seat.Online || p1Seat.DeadlineMS != now.UnixMilli()+engine.reserveTTL.Milliseconds() {
+		t.Fatalf("reserved seat state = %#v", p1Seat)
+	}
+	p2Seat := findSeat(states["p2"], "p2")
+	if p2Seat.Status != StatusConfirmed || !p2Seat.Online {
+		t.Fatalf("online confirmed seat = %#v", p2Seat)
+	}
+	if resp := states["p3"]; resp.Type != "queued" {
+		t.Fatalf("waiting player = %#v", resp)
+	}
+
+	*now = now.Add(3 * time.Second)
+	engine.Tick()
+	states = engine.PublicRoomStates()
+	p3Seat := findSeat(states["p3"], "p3")
+	if p3Seat.Status != StatusInvited || !p3Seat.Online || p3Seat.DeadlineMS == 0 {
+		t.Fatalf("backfill invitation seat = %#v", p3Seat)
+	}
+	final := engine.Handle(Request{Type: "confirm", PlayerID: "p3", RoomID: roomID}, sessions["p3"])
+	if final.Type != "confirmed" || final.DeadlineMS != 0 {
+		t.Fatalf("backfill confirm = %#v", final)
+	}
+	room := engine.rooms[roomID]
+	if room.DeadlineUnixMS != 0 {
+		t.Fatalf("stale proposal deadline kept after refill: %d", room.DeadlineUnixMS)
+	}
+	data, err := os.ReadFile(engine.store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "deadline_unix_ms\": 0") {
+		t.Fatalf("persisted state kept cleared deadline field: %s", data)
+	}
+
+	engine.Disconnect(sessions["p3"])
+	*now = now.Add(3 * time.Second)
+	engine.Tick()
+	states = engine.PublicRoomStates()
+	if vacant := findVacantSeat(states["p2"]); vacant.Status != StatusVacant {
+		t.Fatalf("released seat without a waiter was not vacant: %#v", states["p2"].Seats)
+	}
+
+	restarted, err := NewEngine(engine.store, func() time.Time { return *now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.SetTimeouts(10*time.Second, 15*time.Second, 2*time.Second)
+	restored := restarted.rooms[roomID]
+	if restored == nil || restored.DeadlineUnixMS != 0 || restored.Status != StatusActive {
+		t.Fatalf("restored room kept stale deadline: %#v", restored)
+	}
+}
+
+func findVacantSeat(resp Response) SeatState {
+	for _, seat := range resp.Seats {
+		if seat.Status == StatusVacant {
+			return seat
+		}
+	}
+	return SeatState{Status: "missing"}
+}
+
+func TestRestartKeepsReservationBoundary(t *testing.T) {
+	engine, now := testEngine(t)
+	sessions := map[string]string{}
+	for _, player := range []string{"p1", "p2", "p3"} {
+		session, _ := engine.Hello(player)
+		sessions[player] = session
+	}
+	roomID := activeRoom(t, engine, sessions, "p1", "p2")
+	engine.Handle(queueReq("p3", 12, 2), sessions["p3"])
+	disconnectAt := now.Add(time.Second)
+	*now = disconnectAt
+	engine.Disconnect(sessions["p1"])
+
+	restartedAt := disconnectAt.Add(500 * time.Millisecond)
+	restarted, err := NewEngine(engine.store, func() time.Time { return restartedAt })
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.SetTimeouts(10*time.Second, 15*time.Second, 2*time.Second)
+	room := restarted.rooms[roomID]
+	if room == nil || room.Members["p1"] == nil || !room.Members["p1"].Disconnected {
+		t.Fatalf("reserved seat lost on restart: %#v", room)
+	}
+	if room.Members["p1"].DisconnectedSinceUnixMS != disconnectAt.UnixMilli() {
+		t.Fatalf("reservation boundary moved on restart: %#v", room.Members["p1"])
+	}
+	_, helloResp := restarted.Hello("p1")
+	if helloResp.Type != "resumed" || helloResp.Status != StatusActive {
+		t.Fatalf("reserved-seat reconnect = %#v", helloResp)
+	}
+}
+
+func TestDuplicateConfirmInterleavedWithBackfillKeepsRoomActive(t *testing.T) {
+	engine, now := testEngine(t)
+	sessions := map[string]string{}
+	for _, player := range []string{"p1", "p2", "p3"} {
+		session, _ := engine.Hello(player)
+		sessions[player] = session
+	}
+	roomID := activeRoom(t, engine, sessions, "p1", "p2")
+	engine.Handle(queueReq("p3", 12, 2), sessions["p3"])
+	engine.Disconnect(sessions["p2"])
+	*now = now.Add(3 * time.Second)
+	engine.Tick()
+	engine.Handle(Request{Type: "confirm", PlayerID: "p3", RoomID: roomID}, sessions["p3"])
+
+	oldSession := sessions["p2"]
+	newSession, _ := engine.Hello("p2")
+	if resp := engine.Handle(Request{Type: "confirm", PlayerID: "p2", RoomID: roomID}, oldSession); resp.Reason != "stale_session" {
+		t.Fatalf("stale session after refill = %#v", resp)
+	}
+	if resp := engine.Handle(Request{Type: "confirm", PlayerID: "p2", RoomID: roomID}, newSession); resp.Type != "error" || resp.Reason != "not_invited" {
+		t.Fatalf("new session without seat acted on room: %#v", resp)
+	}
+	dup := engine.Handle(Request{Type: "confirm", PlayerID: "p1", RoomID: roomID}, sessions["p1"])
+	if dup.Type != "confirmed" || dup.Status != StatusActive {
+		t.Fatalf("duplicate confirm regressed room: %#v", dup)
+	}
+	room := engine.rooms[roomID]
+	if room.Status != StatusActive || room.Members["p2"] != nil || room.Members["p3"] == nil || room.DeadlineUnixMS != 0 {
+		t.Fatalf("final room state = %#v", room)
 	}
 }

@@ -51,4 +51,13 @@ go run ./cmd/demo -state /tmp/multiplayer-session-demo.json
 {"type":"result","session_id":"...","player_id":"p1"}
 ```
 
-响应类型包括 `queued`、`invited`、`confirmed`、`room_state`、`resumed`、`canceled`、`rejected`、`result` 和 `error`。未完成的确认返回 `room_state`；房间达到 active 时，所有成员都会收到携带相同成员名单的 `confirmed`。`room_state` 在房间成员或等待状态变化时推送给当前有效会话，保留中的席位以 `reserved` 原因标注。
+响应类型包括 `queued`、`invited`、`confirmed`、`room_state`、`resumed`、`canceled`、`rejected`、`result` 和 `error`。未完成的确认返回 `room_state`；房间达到 active 时，所有成员都会收到携带相同成员名单的 `confirmed`。成员断线、保留到期、补位邀请或等待队列变化时，当前有效会话都会收到 `room_state`。
+
+房间相关响应携带稳定的 `seats` 席位数组（按席位号排序，长度等于目标人数），每个席位包含：
+
+- `status=confirmed`：已确认席位；`online=true` 表示当前会话在线，`false` 不会出现在已确认在线成员身上。
+- `status=reserved`：已确认成员断线后的保留席位，`deadline_ms` 是保留截止时间；此前不会补位，也不会出现空缺。
+- `status=invited`：席位已被补位邀请占用但尚未确认，`deadline_ms` 是该邀请的提议截止时间。
+- `status=vacant`：保留到期后释放、等待补位的空缺席位。
+
+`members` 仍只列出当前已确认的成员 ID，客户端无需通过成员是否在名单中猜测断线；归属和保留/补位边界一律以 `seats` 为准。最终确认或补位确认使房间全员确认后，活动房间残留的提议 `deadline_ms` 会立即清零，并从持久化 JSON 中省略；保留截止时间则始终按断线时刻持久化，保存重开后沿用同一个到期边界。重开时没有活动会话的席位按保留席位处理。

@@ -20,6 +20,8 @@ type QueueRecord struct {
 
 type MemberRecord struct {
 	Status                  string `json:"status"`
+	Seat                    int    `json:"seat,omitempty"`
+	JoinSeq                 int64  `json:"join_seq,omitempty"`
 	Disconnected            bool   `json:"disconnected,omitempty"`
 	DisconnectedSinceUnixMS int64  `json:"disconnected_since_unix_ms,omitempty"`
 }
@@ -32,7 +34,7 @@ type RoomRecord struct {
 	Status           string                  `json:"status"`
 	Members          map[string]MemberRecord `json:"members"`
 	CreatedSeq       int64                   `json:"created_seq"`
-	DeadlineUnixMS   int64                   `json:"deadline_unix_ms"`
+	DeadlineUnixMS   int64                   `json:"deadline_unix_ms,omitempty"`
 	EmptySinceUnixMS int64                   `json:"empty_since_unix_ms,omitempty"`
 }
 
@@ -56,7 +58,8 @@ func (s *Store) Save(nextSeq, nextRoom int64, queue []QueueRecord, rooms map[str
 	for _, room := range rooms {
 		members := make(map[string]MemberRecord, len(room.Members))
 		for id, member := range room.Members {
-			members[id] = MemberRecord{Status: member.Status, Disconnected: member.Disconnected, DisconnectedSinceUnixMS: member.DisconnectedSinceUnixMS}
+			members[id] = MemberRecord{Status: member.Status, Seat: member.Seat, JoinSeq: member.JoinSeq,
+				Disconnected: member.Disconnected, DisconnectedSinceUnixMS: member.DisconnectedSinceUnixMS}
 		}
 		records = append(records, RoomRecord{
 			ID: room.ID, Mode: room.Mode, Level: room.Level, Size: room.Size,
@@ -116,6 +119,7 @@ func (s *Store) Load(nowMS int64, proposalTTLMS int64) (int64, int64, []QueueRec
 		room := &Room{ID: rec.ID, Mode: rec.Mode, Level: rec.Level, Size: rec.Size,
 			Status: rec.Status, Members: map[string]*Member{}, CreatedSeq: rec.CreatedSeq,
 			DeadlineUnixMS: rec.DeadlineUnixMS, EmptySinceUnixMS: rec.EmptySinceUnixMS}
+		seatOrder := make([]string, 0, len(rec.Members))
 		for playerID, memberRec := range rec.Members {
 			if previous := occupied[playerID]; previous != "" {
 				return 0, 0, nil, nil, nil, fmt.Errorf("duplicate room occupancy for %s in %s and %s", playerID, previous, rec.ID)
@@ -124,7 +128,29 @@ func (s *Store) Load(nowMS int64, proposalTTLMS int64) (int64, int64, []QueueRec
 			if queued[playerID] {
 				return 0, 0, nil, nil, nil, fmt.Errorf("duplicate occupancy for %s", playerID)
 			}
-			room.Members[playerID] = &Member{PlayerID: playerID, Status: memberRec.Status, Disconnected: memberRec.Disconnected, DisconnectedSinceUnixMS: memberRec.DisconnectedSinceUnixMS}
+			room.Members[playerID] = &Member{PlayerID: playerID, Status: memberRec.Status, Seat: memberRec.Seat, JoinSeq: memberRec.JoinSeq,
+				Disconnected: memberRec.Disconnected, DisconnectedSinceUnixMS: memberRec.DisconnectedSinceUnixMS}
+			seatOrder = append(seatOrder, playerID)
+		}
+		used := map[int]bool{}
+		needsSeat := []string{}
+		for _, playerID := range seatOrder {
+			member := room.Members[playerID]
+			if member.Seat >= 0 && member.Seat < room.Size && !used[member.Seat] {
+				used[member.Seat] = true
+			} else {
+				needsSeat = append(needsSeat, playerID)
+			}
+		}
+		sort.Strings(needsSeat)
+		for _, playerID := range needsSeat {
+			for seat := 0; seat < room.Size; seat++ {
+				if !used[seat] {
+					room.Members[playerID].Seat = seat
+					used[seat] = true
+					break
+				}
+			}
 		}
 		if room.Status == StatusProposed {
 			for playerID, member := range room.Members {
@@ -137,6 +163,12 @@ func (s *Store) Load(nowMS int64, proposalTTLMS int64) (int64, int64, []QueueRec
 			continue
 		}
 		if room.Status != StatusCanceled {
+			for _, member := range room.Members {
+				if !member.Disconnected {
+					member.Disconnected = true
+					member.DisconnectedSinceUnixMS = nowMS
+				}
+			}
 			rooms[room.ID] = room
 		}
 	}
