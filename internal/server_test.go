@@ -296,3 +296,111 @@ func TestTCPReconnectKeepsReservedSeatAndRejectsStaleSession(t *testing.T) {
 		t.Fatalf("results after resume = p1:%q p2:%q", engine.Result("p1"), engine.Result("p2"))
 	}
 }
+
+func seatState(seats []SeatState, player string) string {
+	for _, seat := range seats {
+		if seat.PlayerID == player {
+			return seat.State
+		}
+	}
+	return ""
+}
+
+func TestTCPSeatStatesAcrossDisconnectReconnectExpiryAndDuplicateConfirm(t *testing.T) {
+	server, engine := startTestServer(t, time.Second, 2*time.Second, 400*time.Millisecond)
+	p1 := dialTCP(t, server.Address(), "p1")
+	p2 := dialTCP(t, server.Address(), "p2")
+	p3 := dialTCP(t, server.Address(), "p3")
+	p1.request(map[string]interface{}{"type": "queue", "mode": "ranked", "level": 10, "room_size": 2})
+	p2.request(map[string]interface{}{"type": "queue", "mode": "ranked", "level": 11, "room_size": 2})
+	invited := p1.readUntil("invited")
+	p2.readUntil("invited")
+	p1.request(map[string]interface{}{"type": "confirm", "room_id": invited.RoomID})
+	p2.request(map[string]interface{}{"type": "confirm", "room_id": invited.RoomID})
+	p1.readUntil("confirmed")
+	p2.readUntil("confirmed")
+
+	p3.request(map[string]interface{}{"type": "queue", "mode": "ranked", "level": 12, "room_size": 2})
+	p3.readUntil("queued")
+
+	// Brief disconnect: p1 must see an explicit reserved seat plus its deadline.
+	p2.close()
+	var reserved Response
+	for i := 0; i < 40; i++ {
+		reserved = p1.readUntil("room_state")
+		if seatState(reserved.Seats, "p2") == SeatReserved {
+			break
+		}
+	}
+	if got := seatState(reserved.Seats, "p2"); got != SeatReserved {
+		t.Fatalf("p1 sees p2 seat %q during reservation: %#v", got, reserved.Seats)
+	}
+	if got := seatState(reserved.Seats, "p1"); got != SeatOnline || reserved.DeadlineMS != 0 || reserved.Status != StatusActive {
+		t.Fatalf("reserved room_state = %#v", reserved)
+	}
+
+	// Back within the grace period: seat returns to online without backfill.
+	p2 = dialTCP(t, server.Address(), "p2")
+	if p2.last.Type != "resumed" || seatState(p2.last.Seats, "p2") != SeatOnline {
+		t.Fatalf("resume seats = %#v", p2.last.Seats)
+	}
+	online := p1.readUntil("confirmed", "room_state")
+	if online.Type != "confirmed" || seatState(online.Seats, "p2") != SeatOnline {
+		t.Fatalf("p1 view after resume = %#v", online)
+	}
+	if online.DeadlineMS != 0 {
+		t.Fatalf("recovered room carried a deadline: %#v", online)
+	}
+
+	// Expiry this time: waiting player receives the invited seat, p1 sees it too.
+	p2.close()
+	p1.readUntil("room_state")
+	refill := p3.readUntil("invited")
+	if refill.RoomID != invited.RoomID || seatState(refill.Seats, "p3") != SeatInvited {
+		t.Fatalf("refill invitation = %#v", refill)
+	}
+	if refill.DeadlineMS == 0 {
+		t.Fatalf("refill invitation missing offer deadline: %#v", refill)
+	}
+	var p1State Response
+	for i := 0; i < 40; i++ {
+		p1State = p1.readUntil("room_state")
+		if seatState(p1State.Seats, "p3") == SeatInvited {
+			break
+		}
+	}
+	if seatState(p1State.Seats, "p3") != SeatInvited {
+		t.Fatalf("p1 cannot see pending replacement: %#v", p1State.Seats)
+	}
+
+	// Interleaved duplicate confirms stay idempotent; final refill clears timing.
+	p1.request(map[string]interface{}{"type": "confirm", "room_id": invited.RoomID})
+	p1Dup := p1.readUntil("room_state")
+	if p1Dup.Status != StatusActive {
+		t.Fatalf("duplicate confirm during refill = %#v", p1Dup)
+	}
+	p3.request(map[string]interface{}{"type": "confirm", "room_id": invited.RoomID})
+	finalP3 := p3.readUntil("confirmed")
+	if finalP3.Status != StatusActive || finalP3.DeadlineMS != 0 {
+		t.Fatalf("final refill decision = %#v", finalP3)
+	}
+	finalP1 := p1.readUntil("confirmed")
+	if seatState(finalP1.Seats, "p3") != SeatOnline || seatState(finalP1.Seats, "p2") != "" {
+		t.Fatalf("p1 final seats = %#v", finalP1.Seats)
+	}
+	if finalP1.DeadlineMS != 0 {
+		t.Fatalf("final broadcast kept deadline: %#v", finalP1)
+	}
+
+	// Late message from the old connection cannot affect the new session.
+	p2 = dialTCP(t, server.Address(), "p2")
+	p2.request(map[string]interface{}{"type": "confirm", "room_id": invited.RoomID})
+	if resp := p2.readUntil("error"); resp.Reason != "not_invited" {
+		t.Fatalf("expired member confirm = %#v", resp)
+	}
+	time.Sleep(80 * time.Millisecond)
+	room := engine.rooms[invited.RoomID]
+	if room.DeadlineUnixMS != 0 || room.Members["p2"] != nil || room.Members["p3"] == nil {
+		t.Fatalf("post-refill room = %#v", room)
+	}
+}

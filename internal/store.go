@@ -22,6 +22,8 @@ type MemberRecord struct {
 	Status                  string `json:"status"`
 	Disconnected            bool   `json:"disconnected,omitempty"`
 	DisconnectedSinceUnixMS int64  `json:"disconnected_since_unix_ms,omitempty"`
+	ReserveUntilUnixMS      int64  `json:"reserve_until_unix_ms,omitempty"`
+	JoinSeq                 int64  `json:"join_seq,omitempty"`
 }
 
 type RoomRecord struct {
@@ -56,7 +58,9 @@ func (s *Store) Save(nextSeq, nextRoom int64, queue []QueueRecord, rooms map[str
 	for _, room := range rooms {
 		members := make(map[string]MemberRecord, len(room.Members))
 		for id, member := range room.Members {
-			members[id] = MemberRecord{Status: member.Status, Disconnected: member.Disconnected, DisconnectedSinceUnixMS: member.DisconnectedSinceUnixMS}
+			members[id] = MemberRecord{Status: member.Status, Disconnected: member.Disconnected,
+				DisconnectedSinceUnixMS: member.DisconnectedSinceUnixMS, ReserveUntilUnixMS: member.ReserveUntilUnixMS,
+				JoinSeq: member.JoinSeq}
 		}
 		records = append(records, RoomRecord{
 			ID: room.ID, Mode: room.Mode, Level: room.Level, Size: room.Size,
@@ -124,7 +128,10 @@ func (s *Store) Load(nowMS int64, proposalTTLMS int64) (int64, int64, []QueueRec
 			if queued[playerID] {
 				return 0, 0, nil, nil, nil, fmt.Errorf("duplicate occupancy for %s", playerID)
 			}
-			room.Members[playerID] = &Member{PlayerID: playerID, Status: memberRec.Status, Disconnected: memberRec.Disconnected, DisconnectedSinceUnixMS: memberRec.DisconnectedSinceUnixMS}
+			member := &Member{PlayerID: playerID, Status: memberRec.Status, Disconnected: memberRec.Disconnected,
+				DisconnectedSinceUnixMS: memberRec.DisconnectedSinceUnixMS, ReserveUntilUnixMS: memberRec.ReserveUntilUnixMS,
+				JoinSeq: memberRec.JoinSeq}
+			room.Members[playerID] = member
 		}
 		if room.Status == StatusProposed {
 			for playerID, member := range room.Members {

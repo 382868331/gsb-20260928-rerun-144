@@ -69,14 +69,25 @@ func main() {
 	p3.expect("queued")
 	oldSession := p2.session
 	_ = p2.conn.Close()
+	reserved := p1.expect("room_state")
+	if reserved.Status != internal.StatusActive || seatOf(reserved.Seats, "p2") != internal.SeatReserved ||
+		seatOf(reserved.Seats, "p1") != internal.SeatOnline || reserved.DeadlineMS != 0 {
+		log.Fatalf("p1 cannot explain the reserved seat: %#v", reserved)
+	}
+	log.Printf("p1 sees p2 reserved until %d while the other seat stays online", reserved.Seats[1].DeadlineMS)
 	time.Sleep(120 * time.Millisecond)
 	p3.snapshot()
 	if snap := p3.expect("snapshot"); !contains(snap.Waiting, "p3") {
 		log.Fatalf("reserved seat was refilled during grace period: %#v", snap)
 	}
 	p2.reconnect(addr)
-	if resumed := p2.result; resumed.Type != "resumed" || resumed.RoomID != first.RoomID || resumed.Status != internal.StatusActive {
+	if resumed := p2.result; resumed.Type != "resumed" || resumed.RoomID != first.RoomID || resumed.Status != internal.StatusActive ||
+		seatOf(resumed.Seats, "p2") != internal.SeatOnline {
 		log.Fatalf("p2 did not resume its reserved seat: %#v", resumed)
+	}
+	recovered := p1.expect("confirmed")
+	if recovered.DeadlineMS != 0 || seatOf(recovered.Seats, "p2") != internal.SeatOnline {
+		log.Fatalf("p1 view did not recover cleanly: %#v", recovered)
 	}
 	p2.sendAs(oldSession, map[string]interface{}{"type": "confirm", "room_id": first.RoomID})
 	if resp := p2.expect("error"); resp.Reason != "stale_session" {
@@ -85,18 +96,31 @@ func main() {
 
 	log.Println("phase 3: reservation expires and a waiting player backfills")
 	_ = p2.conn.Close()
+	if reserved := p1.expect("room_state"); seatOf(reserved.Seats, "p2") != internal.SeatReserved {
+		log.Fatalf("second disconnect not marked reserved: %#v", reserved)
+	}
 	time.Sleep(*reserveTTL + 300*time.Millisecond)
 	refill := p3.expect("invited")
-	if refill.RoomID != first.RoomID {
+	if refill.RoomID != first.RoomID || seatOf(refill.Seats, "p3") != internal.SeatInvited || refill.DeadlineMS == 0 {
 		log.Fatalf("p3 was offered %s instead of %s", refill.RoomID, first.RoomID)
 	}
+	pending := p1.expect("room_state")
+	if seatOf(pending.Seats, "p3") != internal.SeatInvited || pending.DeadlineMS != 0 {
+		log.Fatalf("p1 cannot see the pending backfill: %#v", pending)
+	}
+	p1.confirm(first.RoomID)
+	if dup := p1.expect("room_state"); dup.Status != internal.StatusActive {
+		log.Fatalf("duplicate confirm during backfill regressed the room: %#v", dup)
+	}
 	p3.confirmFragmented(refill.RoomID)
-	if resp := p3.expect("confirmed"); resp.Status != internal.StatusActive {
+	if resp := p3.expect("confirmed"); resp.Status != internal.StatusActive || resp.DeadlineMS != 0 ||
+		seatOf(resp.Seats, "p3") != internal.SeatOnline {
 		log.Fatalf("refill confirmation = %#v", resp)
 	}
 	for {
 		resp := p1.expect("confirmed")
-		if contains(resp.Members, "p3") && !contains(resp.Members, "p2") {
+		if contains(resp.Members, "p3") && !contains(resp.Members, "p2") && resp.DeadlineMS == 0 &&
+			seatOf(resp.Seats, "p3") == internal.SeatOnline {
 			break
 		}
 		if !contains(resp.Members, "p2") {
@@ -123,7 +147,9 @@ func main() {
 	p3.reconnect(addr)
 	resumedP1 := p1.expect("resumed")
 	resumedP3 := p3.expect("resumed")
-	if resumedP1.RoomID != resumedP3.RoomID || resumedP1.RoomID != first.RoomID {
+	if resumedP1.RoomID != resumedP3.RoomID || resumedP1.RoomID != first.RoomID ||
+		seatOf(resumedP1.Seats, "p1") != internal.SeatOnline || seatOf(resumedP1.Seats, "p3") != internal.SeatOnline ||
+		resumedP1.DeadlineMS != 0 {
 		log.Fatalf("restarted room = %s %s, want %s", resumedP1.RoomID, resumedP3.RoomID, first.RoomID)
 	}
 	p1.resultQuery()
@@ -206,6 +232,15 @@ func contains(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func seatOf(seats []internal.SeatState, player string) string {
+	for _, seat := range seats {
+		if seat.PlayerID == player {
+			return seat.State
+		}
+	}
+	return ""
 }
 
 func dial(id, addr string) *client {
