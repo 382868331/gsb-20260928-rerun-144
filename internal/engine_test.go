@@ -448,8 +448,30 @@ func TestPersistedRoomHasNoStaleDeadlineAfterRefill(t *testing.T) {
 		t.Fatalf("restored room kept stale deadline: %#v", room)
 	}
 	states := restarted.PublicRoomStates()
-	if states["p1"].Type != "confirmed" || states["p1"].DeadlineMS != 0 {
+	// A persisted confirmed seat is not a live connection: after restart both
+	// seats are reserved until the members actually reconnect.
+	if states["p1"].Type != "room_state" || states["p1"].Reason != SeatReserved {
 		t.Fatalf("restarted view = %#v", states["p1"])
+	}
+	for _, player := range []string{"p1", "p3"} {
+		seat := findSeat(t, states["p1"].Seats, player)
+		if seat.State != SeatReserved || seat.DeadlineMS == 0 {
+			t.Fatalf("restored seat for %s = %#v", player, seat)
+		}
+	}
+	persisted := restarted.rooms[roomID].Members["p1"]
+	if persisted == nil || !persisted.Disconnected || persisted.ReserveUntilUnixMS == 0 {
+		t.Fatalf("persisted member not reserved after restart: %#v", persisted)
+	}
+	if _, resp := restarted.Hello("p1"); resp.Type != "resumed" {
+		t.Fatalf("p1 resume = %#v", resp)
+	}
+	if _, resp := restarted.Hello("p3"); resp.Type != "resumed" {
+		t.Fatalf("p3 resume = %#v", resp)
+	}
+	states = restarted.PublicRoomStates()
+	if states["p1"].Type != "confirmed" || states["p1"].DeadlineMS != 0 {
+		t.Fatalf("view after reconnect = %#v", states["p1"])
 	}
 }
 

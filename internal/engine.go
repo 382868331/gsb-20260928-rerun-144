@@ -111,6 +111,19 @@ func (r *Room) hasDisconnected() bool {
 	return false
 }
 
+// hasConfirmedMember reports whether any seat is owned by a confirmed member,
+// including a reserved (temporarily offline) one. Reserved owners still count:
+// after a restart every confirmed seat is reserved, and open seats must stay
+// eligible for backfill once their reservation expires.
+func (r *Room) hasConfirmedMember() bool {
+	for _, member := range r.Members {
+		if member.Status == StatusConfirmed {
+			return true
+		}
+	}
+	return false
+}
+
 // roomView builds the externally visible state for a room participant. A room
 // only resolves to the final confirmed decision once it is full and every
 // member has confirmed; during reservation/backfill it stays a room_state so
@@ -195,6 +208,14 @@ func (e *Engine) normalizeLoadedRooms(nowMS int64) {
 			continue
 		}
 		for playerID, member := range room.Members {
+			// A persisted confirmed seat only proves past ownership, not a live
+			// connection in this process. Restore it as reserved until the
+			// member actually reconnects, with an explicit reserve deadline.
+			if member.Status == StatusConfirmed && !member.Disconnected {
+				member.Disconnected = true
+				member.DisconnectedSinceUnixMS = nowMS
+				member.ReserveUntilUnixMS = nowMS + e.reserveTTL.Milliseconds()
+			}
 			if member.Disconnected {
 				if member.ReserveUntilUnixMS <= 0 {
 					member.ReserveUntilUnixMS = member.DisconnectedSinceUnixMS + e.reserveTTL.Milliseconds()
@@ -586,7 +607,7 @@ func (e *Engine) fillVacancies() {
 		if room.Status != StatusProposed && room.Status != StatusActive {
 			continue
 		}
-		if room.Status == StatusActive && len(room.confirmedIDs()) == 0 {
+		if room.Status == StatusActive && !room.hasConfirmedMember() {
 			continue
 		}
 		for len(room.Members) < room.Size {
