@@ -145,12 +145,23 @@ func main() {
 	addr, shutdown = startServer(*statePath, *proposalTTL, *emptyTTL, *reserveTTL)
 	p1.reconnect(addr)
 	p3.reconnect(addr)
-	resumedP1 := p1.expect("resumed")
-	resumedP3 := p3.expect("resumed")
-	if resumedP1.RoomID != resumedP3.RoomID || resumedP1.RoomID != first.RoomID ||
-		seatOf(resumedP1.Seats, "p1") != internal.SeatOnline || seatOf(resumedP1.Seats, "p3") != internal.SeatOnline ||
-		resumedP1.DeadlineMS != 0 {
-		log.Fatalf("restarted room = %s %s, want %s", resumedP1.RoomID, resumedP3.RoomID, first.RoomID)
+	// A persisted confirmed seat is not a live connection after restart: p3
+	// stays explicitly reserved until it actually reconnects.
+	resumedP1 := p1.result
+	if resumedP1.Type != "resumed" || resumedP1.RoomID != first.RoomID ||
+		seatOf(resumedP1.Seats, "p1") != internal.SeatOnline ||
+		seatOf(resumedP1.Seats, "p3") != internal.SeatReserved || resumedP1.DeadlineMS != 0 {
+		log.Fatalf("restart did not hold the absent seat as reserved: %#v", resumedP1)
+	}
+	p3.reconnect(addr)
+	resumedP3 := p3.result
+	if resumedP3.Type != "resumed" || resumedP3.RoomID != first.RoomID ||
+		seatOf(resumedP3.Seats, "p1") != internal.SeatOnline || seatOf(resumedP3.Seats, "p3") != internal.SeatOnline {
+		log.Fatalf("reconnected member did not recover its seat: %#v", resumedP3)
+	}
+	if final := p1.expect("confirmed"); !contains(final.Members, "p1") || !contains(final.Members, "p3") ||
+		final.DeadlineMS != 0 || seatOf(final.Seats, "p3") != internal.SeatOnline {
+		log.Fatalf("post-restart final decision = %#v", final)
 	}
 	p1.resultQuery()
 	if resp := p1.expect("result"); resp.Status != internal.StatusActive {

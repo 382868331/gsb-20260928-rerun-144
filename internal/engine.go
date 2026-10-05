@@ -195,6 +195,14 @@ func (e *Engine) normalizeLoadedRooms(nowMS int64) {
 			continue
 		}
 		for playerID, member := range room.Members {
+			// A persisted confirmed seat only proves ownership, not a live
+			// connection in this process. Hold the seat as reserved with a
+			// fresh reserve deadline until the member actually reconnects.
+			if !member.Disconnected && member.Status == StatusConfirmed {
+				member.Disconnected = true
+				member.DisconnectedSinceUnixMS = nowMS
+				member.ReserveUntilUnixMS = nowMS + e.reserveTTL.Milliseconds()
+			}
 			if member.Disconnected {
 				if member.ReserveUntilUnixMS <= 0 {
 					member.ReserveUntilUnixMS = member.DisconnectedSinceUnixMS + e.reserveTTL.Milliseconds()
@@ -586,8 +594,19 @@ func (e *Engine) fillVacancies() {
 		if room.Status != StatusProposed && room.Status != StatusActive {
 			continue
 		}
-		if room.Status == StatusActive && len(room.confirmedIDs()) == 0 {
-			continue
+		if room.Status == StatusActive {
+			// Reserved confirmed seats still own the room: backfill is only
+			// pointless when no confirmed holder remains at all.
+			hasConfirmed := false
+			for _, member := range room.Members {
+				if member.Status == StatusConfirmed {
+					hasConfirmed = true
+					break
+				}
+			}
+			if !hasConfirmed {
+				continue
+			}
 		}
 		for len(room.Members) < room.Size {
 			hadInvited := room.hasInvited()
